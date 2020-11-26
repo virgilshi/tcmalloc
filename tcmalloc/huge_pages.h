@@ -32,18 +32,28 @@
 
 namespace tcmalloc {
 
-inline constexpr size_t kPagesPerHugePage = static_cast<size_t>(1)
-                                            << (kHugePageShift - kPageShift);
+inline constexpr Length kPagesPerHugePage =
+    Length(1 << (kHugePageShift - kPageShift));
 
 // A single aligned huge page.
 struct HugePage {
   void *start_addr() const {
+    ASSERT(pn <= kMaxPageNumber);
     return reinterpret_cast<void *>(pn << kHugePageShift);
   }
 
-  PageId first_page() const { return PageIdContaining(start_addr()); }
+  PageId first_page() const {
+    ASSERT(pn <= kMaxPageNumber);
+    return PageId(pn << (kHugePageShift - kPageShift));
+  }
 
-  size_t index() const { return pn; }
+  size_t index() const {
+    ASSERT(pn <= kMaxPageNumber);
+    return pn;
+  }
+
+  static constexpr uintptr_t kMaxPageNumber =
+      std::numeric_limits<uintptr_t>::max() >> kHugePageShift;
 
   uintptr_t pn;
 };
@@ -80,7 +90,8 @@ inline constexpr HugeLength HLFromBytes(size_t bytes) {
 
 // Rounds *up* to the nearest hugepage.
 inline constexpr HugeLength HLFromPages(Length pages) {
-  return NHugePages((pages + kPagesPerHugePage - 1) / kPagesPerHugePage);
+  return NHugePages((pages + kPagesPerHugePage - Length(1)) /
+                    kPagesPerHugePage);
 }
 
 inline HugeLength &operator++(HugeLength &len) {  // NOLINT(runtime/references)
@@ -89,6 +100,7 @@ inline HugeLength &operator++(HugeLength &len) {  // NOLINT(runtime/references)
 }
 
 inline HugePage &operator++(HugePage &p) {  // NOLINT(runtime/references)
+  ASSERT(p.pn + 1 <= HugePage::kMaxPageNumber);
   p.pn++;
   return p;
 }
@@ -169,6 +181,7 @@ inline constexpr HugeLength operator%(HugeLength lhs, HugeLength rhs) {
 }
 
 inline constexpr HugePage operator+(HugePage lhs, HugeLength rhs) {
+  ASSERT(lhs.pn + rhs.n <= HugePage::kMaxPageNumber);
   return HugePage{lhs.pn + rhs.n};
 }
 
@@ -185,6 +198,7 @@ inline constexpr HugeLength operator-(HugePage lhs, HugePage rhs) {
 }
 
 inline HugePage &operator+=(HugePage &lhs, HugeLength rhs) {
+  ASSERT(lhs.pn + rhs.n <= HugePage::kMaxPageNumber);
   lhs.pn += rhs.n;
   return lhs;
 }

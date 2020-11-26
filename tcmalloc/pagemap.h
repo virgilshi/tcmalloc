@@ -33,6 +33,7 @@
 #include "absl/base/thread_annotations.h"
 #include "tcmalloc/common.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/pages.h"
 #include "tcmalloc/span.h"
 #include "tcmalloc/static_vars.h"
 
@@ -71,7 +72,7 @@ class PageMap2 {
     void* hugepage[kLeafHugepages];
   };
 
-  Leaf* root_[kRootLength];             // Top-level node
+  Leaf* root_[kRootLength];  // Top-level node
   size_t bytes_used_;
 
  public:
@@ -152,7 +153,7 @@ class PageMap2 {
 
   bool Ensure(Number start, size_t n) {
     ASSERT(n > 0);
-    for (Number key = start; key <= start + n - 1; ) {
+    for (Number key = start; key <= start + n - 1;) {
       const Number i1 = key >> kLeafBits;
 
       // Check for overflow
@@ -367,7 +368,7 @@ class PageMap {
   void Set(PageId p, Span* span) { map_.set(p.index(), span); }
 
   bool Ensure(PageId p, Length n) ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock) {
-    return map_.Ensure(p.index(), n);
+    return map_.Ensure(p.index(), n.raw_num());
   }
 
   // Mark an allocated span as being used for small objects of the

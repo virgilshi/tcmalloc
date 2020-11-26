@@ -21,6 +21,7 @@
 #include <atomic>
 #include <utility>
 
+#include "absl/base/attributes.h"
 #include "absl/base/const_init.h"
 #include "absl/base/internal/spinlock.h"
 #include "absl/base/macros.h"
@@ -59,8 +60,8 @@ class TransferCacheManager {
   TransferCacheManager &operator=(const TransferCacheManager &) = delete;
 
   void Init() ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock) {
-    use_lock_free_cache_ =
-        IsExperimentActive(Experiment::TCMALLOC_LOCK_FREE_TRANSFER_CACHE);
+    use_lock_free_cache_ = false;
+
     for (int i = 0; i < kNumClasses; ++i) {
       if (use_lock_free_cache_) {
         auto *c = &cache_[i].lock_free;
@@ -81,7 +82,7 @@ class TransferCacheManager {
       cache_[size_class].legacy.InsertRange(batch, n);
   }
 
-  int RemoveRange(int size_class, void **batch, int n) {
+  ABSL_MUST_USE_RESULT int RemoveRange(int size_class, void **batch, int n) {
     if (use_lock_free_cache_)
       return cache_[size_class].lock_free.RemoveRange(batch, n);
     else
@@ -126,7 +127,7 @@ class TransferCacheManager {
  private:
   static size_t class_to_size(int size_class);
   static size_t num_objects_to_move(int size_class);
-  void *Alloc(size_t size) EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
+  void *Alloc(size_t size) ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
   int DetermineSizeClassToEvict();
   bool ShrinkCache(int size_class) {
     if (use_lock_free_cache_)
@@ -163,7 +164,7 @@ class TransferCacheManager {
   TransferCacheManager(const TransferCacheManager &) = delete;
   TransferCacheManager &operator=(const TransferCacheManager &) = delete;
 
-  void Init() EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock) {
+  void Init() ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock) {
     for (int i = 0; i < kNumClasses; ++i) {
       freelist_[i].Init(i);
     }
@@ -173,7 +174,7 @@ class TransferCacheManager {
     freelist_[size_class].InsertRange(batch.data(), n);
   }
 
-  int RemoveRange(int size_class, void **batch, int n) {
+  ABSL_MUST_USE_RESULT int RemoveRange(int size_class, void **batch, int n) {
     return freelist_[size_class].RemoveRange(batch, n);
   }
 

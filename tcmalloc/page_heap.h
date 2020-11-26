@@ -33,11 +33,11 @@ namespace tcmalloc {
 // contiguous runs of pages (called a "span").
 // -------------------------------------------------------------------------
 
-class PageHeap : public PageAllocatorInterface {
+class PageHeap final : public PageAllocatorInterface {
  public:
-  explicit PageHeap(bool tagged);
+  explicit PageHeap(MemoryTag tag);
   // for testing
-  PageHeap(PageMap* map, bool tagged);
+  PageHeap(PageMap* map, MemoryTag tag);
 
   // Allocate a run of "n" pages.  Returns zero if out of memory.
   // Caller should not pass "n == 0" -- instead, n should have
@@ -82,7 +82,6 @@ class PageHeap : public PageAllocatorInterface {
       ABSL_LOCKS_EXCLUDED(pageheap_lock) override;
 
  private:
-
   // We segregate spans of a given size into two circular linked
   // lists: one for normal spans, and one for spans whose memory
   // has been returned to the system.
@@ -95,7 +94,7 @@ class PageHeap : public PageAllocatorInterface {
   SpanListPair large_ ABSL_GUARDED_BY(pageheap_lock);
 
   // Array mapping from span length to a doubly linked list of free spans
-  SpanListPair free_[kMaxPages] ABSL_GUARDED_BY(pageheap_lock);
+  SpanListPair free_[kMaxPages.raw_num()] ABSL_GUARDED_BY(pageheap_lock);
 
   // Statistics on system, free, and unmapped bytes
   BackingStats stats_ ABSL_GUARDED_BY(pageheap_lock);

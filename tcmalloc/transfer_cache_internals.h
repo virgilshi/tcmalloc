@@ -19,6 +19,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <limits>
+
 #ifdef __x86_64__
 #include <emmintrin.h>
 #include <xmmintrin.h>
@@ -30,11 +32,14 @@
 #include <utility>
 
 #include "absl/base/attributes.h"
+#include "absl/base/casts.h"
 #include "absl/base/const_init.h"
 #include "absl/base/internal/spinlock.h"
 #include "absl/base/macros.h"
 #include "absl/base/optimization.h"
 #include "absl/base/thread_annotations.h"
+#include "absl/synchronization/internal/futex.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
 #include "tcmalloc/central_freelist.h"
 #include "tcmalloc/common.h"
@@ -103,11 +108,11 @@ class TransferCache {
     max_capacity_ = 0;
     SizeInfo info = {0, 0};
 
-    if (cl > 0) {
+    size_t bytes = Manager::class_to_size(cl);
+    if (cl > 0 && bytes > 0) {
       // Limit the maximum size of the cache based on the size class.  If this
       // is not done, large size class objects will consume a lot of memory if
       // they just sit in the transfer cache.
-      size_t bytes = Manager::class_to_size(cl);
       size_t objs_to_move = Manager::num_objects_to_move(cl);
       ASSERT(objs_to_move > 0 && bytes > 0);
 
@@ -205,7 +210,8 @@ class TransferCache {
 
   // Returns the actual number of fetched elements and stores elements in the
   // batch.
-  int RemoveRange(void **batch, int N) ABSL_LOCKS_EXCLUDED(lock_) {
+  ABSL_MUST_USE_RESULT int RemoveRange(void **batch, int N)
+      ABSL_LOCKS_EXCLUDED(lock_) {
     ASSERT(N > 0);
     const int B = Manager::num_objects_to_move(size_class());
     int fetch = 0;
@@ -316,9 +322,11 @@ class TransferCache {
     return info.capacity - info.used >= n;
   }
 
-  bool GrowCache() {
-    CHECK_CONDITION(false && "unused");
-    return true;
+  // Takes lock_ and invokes MakeCacheSpace() on this cache.  Returns true if it
+  // succeeded at growing the cache by a btach size.
+  bool GrowCache() ABSL_LOCKS_EXCLUDED(lock_) {
+    absl::base_internal::SpinLockHolder h(&lock_);
+    return MakeCacheSpace();
   }
 
   // REQUIRES: lock_ is *not* held.
@@ -496,6 +504,10 @@ class LockFreeTransferCache {
   using FreeList = CentralFreeList;
   static constexpr int kMaxCapacityInBatches = 64;
   static constexpr int kInitialCapacityInBatches = 16;
+  // Initialize the queue sequence at a number close to where it will overflow.
+  // There's no cost to doing this and it ensures tests cover the overflow case.
+  static constexpr uint32_t kInitSequenceNumber =
+      std::numeric_limits<uint32_t>::max() - kMaxObjectsToMove;
 
   constexpr explicit LockFreeTransferCache(Manager *owner)
       : LockFreeTransferCache(owner, 0) {}
@@ -512,14 +524,14 @@ class LockFreeTransferCache {
         freelist_(),
         max_capacity_(0),
         capacity_(),
-        head_(),
+        head_(kInitSequenceNumber),
         insert_hits_(0),
         insert_misses_(0),
-        head_committed_(),
-        tail_(),
+        head_committed_(kInitSequenceNumber),
+        tail_(kInitSequenceNumber),
         remove_hits_(0),
         remove_misses_(0),
-        tail_committed_() {}
+        tail_committed_(kInitSequenceNumber) {}
 
   LockFreeTransferCache(const LockFreeTransferCache &) = delete;
   LockFreeTransferCache &operator=(const LockFreeTransferCache &) = delete;
@@ -536,11 +548,11 @@ class LockFreeTransferCache {
     max_capacity_ = 0;
     int32_t capacity = 0;
 
-    if (cl > 0) {
+    size_t bytes = Manager::class_to_size(cl);
+    if (cl > 0 && bytes > 0) {
       // Limit the maximum size of the cache based on the size class.  If this
       // is not done, large size class objects will consume a lot of memory if
       // they just sit in the transfer cache.
-      size_t bytes = Manager::class_to_size(cl);
       batch_size_ = Manager::num_objects_to_move(cl);
       ASSERT(batch_size_ > 0 && bytes > 0);
 
@@ -560,107 +572,69 @@ class LockFreeTransferCache {
           max_capacity_,
           std::max<size_t>(batch_size_, (1024 * 1024) / (bytes * batch_size_) *
                                             batch_size_));
+      if (tcmalloc_internal::Bits::IsZeroOrPow2(
+              static_cast<size_t>(max_capacity_))) {
+        --max_capacity_;
+        slots_mask_ = max_capacity_;
+      } else {
+        slots_mask_ = tcmalloc_internal::Bits::RoundUpToPow2(
+                          static_cast<size_t>(max_capacity_)) -
+                      1;
+      }
+
       capacity = std::min(capacity, max_capacity_);
       capacity_.store(capacity, std::memory_order_relaxed);
       slots_ = reinterpret_cast<void **>(
-          owner_->Alloc(slots_size() * sizeof(void *)));
+          owner_->Alloc((slots_mask_ + 1) * sizeof(void *)));
     }
   }
 
   // Insert the specified batch into the transfer cache.  N is the number of
   // elements in the range.  RemoveRange() is the opposite operation.
-  void InsertRange(absl::Span<void *> batch, int N) {
-    ASSERT(0 < N && N <= batch_size_);
-    int32_t new_h;
-    int32_t old_h = head_.load(std::memory_order_relaxed);
-    do {
-      int32_t t = tail_committed_.load(std::memory_order_acquire);
-
-      if (!EnsureCacheSpace(size_from_pos(old_h, t) + N)) {
-        tracking::Report(kTCInsertMiss, size_class(), 1);
-        insert_misses_.fetch_add(1, std::memory_order_relaxed);
-        freelist_.InsertRange(batch.data(), N);
-        return;
-      }
-
-      new_h = old_h + N;
-      if (new_h >= slots_size()) new_h -= slots_size();
-    } while (!head_.compare_exchange_weak(
-        old_h, new_h, std::memory_order_relaxed, std::memory_order_relaxed));
+  void InsertRange(absl::Span<void *> batch, int n) {
+    ASSERT(0 < n && n <= batch_size_);
+    absl::optional<Range> r = ClaimInsert(n);
+    if (!r.has_value()) {
+      tracking::Report(kTCInsertMiss, size_class(), 1);
+      insert_misses_.fetch_add(1, std::memory_order_relaxed);
+      freelist_.InsertRange(batch.data(), n);
+      return;
+    }
 
     tracking::Report(kTCInsertHit, size_class(), 1);
     insert_hits_.fetch_add(1, std::memory_order_relaxed);
-    if (old_h < new_h) {
-      ASSERT(new_h - old_h == N);
-      void **entry = GetSlot(old_h);
-      memcpy(entry, batch.data(), sizeof(void *) * N);
-    } else {
-      int32_t overhang = slots_size() - old_h;
-      ASSERT(overhang + new_h == N);
-      void **entry = GetSlot(old_h);
-      memcpy(entry, batch.data(), sizeof(void *) * overhang);
-      batch.remove_prefix(overhang);
-      entry = GetSlot(0);
-      memcpy(entry, batch.data(), sizeof(void *) * new_h);
-    }
-
-    AdvanceCommitLine(&head_committed_, old_h, new_h);
+    CopyIntoSlots(batch.data(), *r);
+    head_committed_.AdvanceCommitLine(*r, batch_size_);
   }
 
   // Returns the actual number of fetched elements and stores elements in the
   // batch.
-  int RemoveRange(void **batch, int N) {
-    ASSERT(N > 0);
-    int32_t new_t;
-    int32_t old_t = tail_.load(std::memory_order_relaxed);
-    do {
-      int32_t h = head_committed_.load(std::memory_order_acquire);
-      int32_t s = size_from_pos(h, old_t);
-      if (s < N) {
-        tracking::Report(kTCRemoveMiss, size_class(), 1);
-        remove_misses_.fetch_add(1, std::memory_order_relaxed);
-        return freelist_.RemoveRange(batch, N);
-      }
-      new_t = old_t + N;
-      if (new_t >= slots_size()) new_t -= slots_size();
-    } while (!tail_.compare_exchange_weak(
-        old_t, new_t, std::memory_order_relaxed, std::memory_order_relaxed));
+  ABSL_MUST_USE_RESULT int RemoveRange(void **batch, int n) {
+    ASSERT(n > 0);
+    absl::optional<Range> r = ClaimRemove(n);
+    if (!r.has_value()) {
+      tracking::Report(kTCRemoveMiss, size_class(), 1);
+      remove_misses_.fetch_add(1, std::memory_order_relaxed);
+      return freelist_.RemoveRange(batch, n);
+    }
 
     tracking::Report(kTCRemoveHit, size_class(), 1);
     remove_hits_.fetch_add(1, std::memory_order_relaxed);
-    if (old_t < new_t) {
-      ASSERT(new_t - old_t == N);
-      void **entry = GetSlot(old_t);
-      memcpy(batch, entry, sizeof(void *) * N);
-    } else {
-      size_t overhang = slots_size() - old_t;
-      ASSERT(overhang + new_t == N);
-
-      void **entry = GetSlot(old_t);
-      memcpy(batch, entry, sizeof(void *) * overhang);
-      batch += overhang;
-      entry = GetSlot(0);
-      memcpy(batch, entry, sizeof(void *) * new_t);
-    }
-
-    AdvanceCommitLine(&tail_committed_, old_t, new_t);
-    return N;
+    CopyFromSlots(batch, *r);
+    tail_committed_.AdvanceCommitLine(*r, batch_size_);
+    return n;
   }
 
   // Returns the number of free objects in the central cache.
   size_t central_length() { return freelist_.length(); }
 
   // Returns the number of free objects in the transfer cache.
-  size_t tc_length() {
+  size_t tc_length() const {
     return size_from_pos(head_committed_.load(std::memory_order_relaxed),
                          tail_committed_.load(std::memory_order_relaxed));
   }
 
-  int32_t size_from_pos(int32_t h, int32_t t) {
-    int32_t s = h - t;
-    if (s < 0) s += slots_size();
-    return s;
-  }
+  uint32_t size_from_pos(uint32_t h, uint32_t t) const { return h - t; }
 
   // Returns the number of spans allocated and deallocated from the CFL
   SpanStats GetSpanStats() const { return freelist_.GetSpanStats(); }
@@ -684,8 +658,11 @@ class LockFreeTransferCache {
   // Ensures that `size_needed` of total capacity is available.  If the cache is
   // full it will try to expand this cache at the cost of some other cache size.
   // Return false on failure.
-  bool EnsureCacheSpace(int32_t size_needed) {
-    while (capacity_.load(std::memory_order_relaxed) < size_needed) {
+  bool HasCacheSpace(uint32_t size_needed) const {
+    return size_needed <= capacity_.load(std::memory_order_relaxed);
+  }
+  bool EnsureCacheSpace(uint32_t size_needed) {
+    while (!HasCacheSpace(size_needed)) {
       if (size_needed > max_capacity_) return false;
       int to_evict = owner_->DetermineSizeClassToEvict();
       if (to_evict == size_class()) return false;
@@ -711,8 +688,8 @@ class LockFreeTransferCache {
 
   // Tries to grow the cache. Returns false if it failed.
   bool GrowCache() {
-    int new_c;
-    int old_c = capacity_.load(std::memory_order_relaxed);
+    uint32_t new_c;
+    uint32_t old_c = capacity_.load(std::memory_order_relaxed);
     do {
       new_c = old_c + batch_size_;
       if (new_c > max_capacity_) return false;
@@ -723,8 +700,8 @@ class LockFreeTransferCache {
 
   // Tries to shrink the Cache.  Return false if it failed.
   bool ShrinkCache() {
-    int new_c;
-    int32_t old_c = capacity_.load(std::memory_order_relaxed);
+    uint32_t new_c;
+    uint32_t old_c = capacity_.load(std::memory_order_relaxed);
     do {
       if (old_c < batch_size_) return false;
       new_c = old_c - batch_size_;
@@ -740,10 +717,8 @@ class LockFreeTransferCache {
     return true;
   }
 
-  bool HasSpareCapacity() {
-    int32_t c = capacity_.load(std::memory_order_relaxed);
-    int32_t s = tc_length();
-    return c - s >= batch_size_;
+  bool HasSpareCapacity() const {
+    return HasCacheSpace(tc_length() + batch_size_);
   }
 
   ABSL_ATTRIBUTE_ALWAYS_INLINE FreeList &freelist() { return freelist_; }
@@ -752,24 +727,271 @@ class LockFreeTransferCache {
   }
 
  private:
-  // TODO(kfm): this is a simple spin lock, it would be nice if we could
-  // report contention here.
-  ABSL_ATTRIBUTE_ALWAYS_INLINE void AdvanceCommitLine(
-      std::atomic<int32_t> *commit, int32_t from, int32_t to) {
-    int32_t temp_pos;
-    while (!commit->compare_exchange_weak(temp_pos = from, to,
-                                          std::memory_order_release,
-                                          std::memory_order_relaxed)) {
-#ifdef __x86_64__
-      _mm_pause();
-#endif
+  struct Range {
+    uint32_t start;
+    uint32_t end;
+  };
+
+  // A `uint32_t` like value that exposes extra operations around awaiting
+  // specific values.
+  //
+  // Internally uses a Futex after an initial spinning period.  `quanta`
+  // parameters are used for computing a Futex mask and *MUST* be the same as
+  // all calls to both `AdvanceCommitLine` and `AwaitEqual`.
+  class SpinValue {
+   public:
+    constexpr SpinValue() : v_(0), sleepers_(0) {}
+    explicit constexpr SpinValue(uint32_t v)
+        : v_(absl::bit_cast<int32_t>(v)), sleepers_(0) {}
+
+    // Fetches the current value.
+    ABSL_ATTRIBUTE_ALWAYS_INLINE
+    uint32_t load(std::memory_order order) const {
+      return absl::bit_cast<uint32_t>(v_.load(order));
     }
+
+    // Advances the value from `r.start` to `r.end`, waiting for the value to
+    // reach `r.start` if it is not there already.
+    ABSL_ATTRIBUTE_ALWAYS_INLINE
+    void AdvanceCommitLine(Range r, int32_t quanta) {
+      const int32_t start = absl::bit_cast<int32_t>(r.start);
+      const int32_t end = absl::bit_cast<int32_t>(r.end);
+      int32_t temp_pos;
+
+      // To avoid missed wake-ups, it's important that the access to "v_" and
+      // "sleepers_" use sequential consistency. Consider a thread T1 here and
+      // concurrent thread T2 in Await():
+      //
+      // T1.1: store new value into v_
+      // T1.2: load sleepers_
+      // T1.3: if sleepers is non-zero, wake futex
+      //
+      // T2.1: load v_, see that it's not the expected value
+      // T2.2: increment sleepers_
+      // T2.3: load v_ again (in futex implementation) and sleep
+      //
+      // C++11 sequential consistency guarantees that there is a single total
+      // order of all atomic operations that are so tagged. Taking as an
+      // example the sequence where T1 is transitioning v_=0 -> v_=1,
+      // and T2 is waiting for v_ == 1. A missed wakeup would of the order:
+      //
+      // T1.1: store(v=1)   -> T1.2: load(sleepers) == 0
+      // T2.1: load(v) == 0 -> T2.2: sleepers++ -> T2.3: load(v)==0 and sleep
+      //
+      // Because of the seq_cst, we know the following relationships in addition
+      // to the "program order" ones expressed above:
+      //
+      // T2.1 -> T1.1 (must have come before since T2 didn't see v = 1)
+      // T1.2 -> T2.2 (must have come before since T1 didn't see the increment)
+      // T2.3 -> T1.1 (must have come before since T2 still didn't see v = 1)
+      //
+      // Putting all the relationships together:
+      //   T2.1 -> T1.1 -> T1.2 -> T2.2 -> T2.3 -> T1.1
+      //
+      // This consists of a cycle, which violates the "sequential consistency
+      // provides a total order" guarantee. Hence, the missed wakeup cannot
+      // happen.
+      if (ABSL_PREDICT_FALSE(!v_.compare_exchange_strong(
+              temp_pos = start, end, std::memory_order_seq_cst,
+              std::memory_order_relaxed))) {
+        AwaitEqual(r.start, quanta);
+        temp_pos = v_.exchange(end, std::memory_order_seq_cst);
+        ASSERT(temp_pos == r.start);
+      }
+      if (ABSL_PREDICT_FALSE(sleepers_.load(std::memory_order_seq_cst))) {
+        absl::synchronization_internal::Futex::WakeBitset(
+            &v_, std::numeric_limits<int32_t>::max(),
+            ComputeFutexBits(r.end, quanta));
+      }
+    }
+
+    // Waits for the value to be equal to `e`.  `quanta` is used for computing a
+    // Futex mask and *MUST* be the same as all calls to quanta passed to
+    // AdvanceCommitLine.  Provides an acquire memory order on any release that
+    // set the `this->value()` to `e`.
+    ABSL_ATTRIBUTE_NOINLINE
+    void AwaitEqual(uint32_t e, int32_t quanta) {
+      const int32_t expected = absl::bit_cast<int32_t>(e);
+      Await([expected](int32_t v) { return v == expected; },
+            ComputeFutexBits(expected, quanta));
+    }
+
+    // Waits for the value to change from `a` in any way.
+    ABSL_ATTRIBUTE_NOINLINE
+    void AwaitChange(uint32_t a) {
+      const int32_t actual = absl::bit_cast<int32_t>(a);
+      Await([actual](int32_t v) { return v != actual; },
+            FUTEX_BITSET_MATCH_ANY);
+    }
+
+   private:
+    // Wait for `condition(current_value)` to return true. If the condition does
+    // not become true after briefly spinning, uses "futex_bits" to wait on the
+    // futex.
+    template <class Condition>
+    void Await(const Condition &condition, int32_t futex_bits) {
+      int32_t cur;
+      do {
+        for (int i = 1024; i > 0; --i) {
+          cur = v_.load(std::memory_order_seq_cst);
+          if (condition(cur)) return;
+#ifdef __x86_64__
+          _mm_pause();
+#endif
+        }
+        // Increment with seq_cst memory order to ensure this is serialized
+        // properly against the read of `sleepers_` in `AdvanceCommitLine`.
+        sleepers_.fetch_add(1, std::memory_order_seq_cst);
+        // Do one more load of `v_` with seq_cst memory order. The
+        // implementation of futex already loads `v_` itself before going to
+        // sleep, but futex doesn't participate in the C++11 memory model, so
+        // we'd best be on the safe side here and do a C++11-compliant load. On
+        // x86 this is a simple unlocked load anyway, so cost isn't high and
+        // this path is already expected to be infrequently executed.
+        if (ABSL_PREDICT_TRUE(v_.load(std::memory_order_seq_cst) == cur)) {
+          absl::synchronization_internal::Futex::WaitBitsetAbsoluteTimeout(
+              &v_, cur, futex_bits, nullptr);
+        }
+        sleepers_.fetch_sub(1, std::memory_order_relaxed);
+      } while (true);
+    }
+
+    // Futex requires an `int32_t` but treats it like an opaque bag of 4 bytes,
+    // so we keep this as an `int32_t` here but have our public interfaces in
+    // terms of the preferred type `uint32_t`.
+    std::atomic<int32_t> v_;
+
+    // Tracks the number of threads currently sleeping on the futex so that we
+    // can avoid the syscall to Wake in the fast path.
+    std::atomic<int32_t> sleepers_;
+  };
+
+  ABSL_ATTRIBUTE_ALWAYS_INLINE
+  void CopyIntoSlots(void **batch, Range r) {
+    r.start &= slots_mask_;
+    r.end &= slots_mask_;
+    if (ABSL_PREDICT_TRUE(r.start < r.end)) {
+      void **entry = GetSlot(r.start);
+      memcpy(entry, batch, sizeof(void *) * (r.end - r.start));
+    } else {
+      int32_t overhang = slots_mask_ + 1 - r.start;
+      void **entry = GetSlot(r.start);
+      memcpy(entry, batch, sizeof(void *) * overhang);
+      batch += overhang;
+      entry = GetSlot(0);
+      memcpy(entry, batch, sizeof(void *) * r.end);
+    }
+  }
+
+  ABSL_ATTRIBUTE_ALWAYS_INLINE
+  void CopyFromSlots(void **batch, Range r) {
+    r.start &= slots_mask_;
+    r.end &= slots_mask_;
+    if (ABSL_PREDICT_TRUE(r.start < r.end)) {
+      void **entry = GetSlot(r.start);
+      memcpy(batch, entry, sizeof(void *) * (r.end - r.start));
+    } else {
+      int32_t overhang = slots_mask_ + 1 - r.start;
+      void **entry = GetSlot(r.start);
+      memcpy(batch, entry, sizeof(void *) * overhang);
+      batch += overhang;
+      entry = GetSlot(0);
+      memcpy(batch, entry, sizeof(void *) * r.end);
+    }
+  }
+
+  ABSL_ATTRIBUTE_ALWAYS_INLINE
+  absl::optional<Range> ClaimInsert(int n) {
+    uint32_t old_h = head_.load(std::memory_order_relaxed);
+    uint32_t new_h = old_h + n;
+    uint32_t tail = tail_committed_.load(std::memory_order_acquire);
+    uint32_t size_needed = size_from_pos(old_h, tail) + n;
+    if (HasCacheSpace(size_needed) &&
+        head_.compare_exchange_strong(old_h, new_h, std::memory_order_relaxed,
+                                      std::memory_order_relaxed)) {
+      return Range{old_h, new_h};
+    }
+    return ClaimInsertSlow(n);
+  }
+
+  ABSL_ATTRIBUTE_NOINLINE
+  absl::optional<Range> ClaimInsertSlow(int n) {
+  CLAIM_INSERT_SLOW:
+    uint32_t new_h;
+    uint32_t old_h = head_.load(std::memory_order_relaxed);
+    do {
+      uint32_t tail = tail_committed_.load(std::memory_order_acquire);
+      uint32_t s = size_from_pos(old_h, tail);
+      if (!EnsureCacheSpace(s + n)) {
+        if (tail != tail_.load(std::memory_order_relaxed)) {
+          // If we have pending removes, wait for some to resolve and try again.
+          // - retest capacity in case the pending inserts were too small.
+          // - use goto instead of tail call to keep stack bounded in non-opt.
+          tail_committed_.AwaitChange(tail);
+          goto CLAIM_INSERT_SLOW;
+        }
+        return absl::nullopt;
+      }
+
+      new_h = old_h + n;
+    } while (!head_.compare_exchange_weak(
+        old_h, new_h, std::memory_order_relaxed, std::memory_order_relaxed));
+    return Range{old_h, new_h};
+  }
+
+  ABSL_ATTRIBUTE_ALWAYS_INLINE
+  absl::optional<Range> ClaimRemove(int n) {
+    uint32_t old_t = tail_.load(std::memory_order_relaxed);
+    uint32_t head = head_committed_.load(std::memory_order_acquire);
+    uint32_t size = size_from_pos(head, old_t);
+    uint32_t new_t = old_t + n;
+    if (n <= size &&
+        tail_.compare_exchange_strong(old_t, new_t, std::memory_order_relaxed,
+                                      std::memory_order_relaxed)) {
+      return Range{old_t, new_t};
+    }
+    return ClaimRemoveSlow(n);
+  }
+
+  ABSL_ATTRIBUTE_NOINLINE
+  absl::optional<Range> ClaimRemoveSlow(int n) {
+  CLAIM_REMOVE_SLOW:
+    uint32_t new_t;
+    uint32_t old_t = tail_.load(std::memory_order_relaxed);
+    do {
+      uint32_t head = head_committed_.load(std::memory_order_acquire);
+      uint32_t s = size_from_pos(head, old_t);
+      if (s < n) {
+        if (head != head_.load(std::memory_order_relaxed)) {
+          // If we have pending inserts, wait for some to resolve and try again.
+          // - retest size in case the pending inserts were too small.
+          // - use goto instead of tail call to keep stack bounded in non-opt.
+          head_committed_.AwaitChange(head);
+          goto CLAIM_REMOVE_SLOW;
+        }
+        return absl::nullopt;
+      }
+      new_t = old_t + n;
+    } while (!tail_.compare_exchange_weak(
+        old_t, new_t, std::memory_order_relaxed, std::memory_order_relaxed));
+    return Range{old_t, new_t};
+  }
+
+  ABSL_ATTRIBUTE_ALWAYS_INLINE
+  static int32_t ComputeFutexBits(uint32_t pos, int32_t quanta) {
+    // We want to bins values according to our quanta so that each of the
+    // nearest increment sets a different bit:
+    //
+    // Value: [0, n), [n, 2*n), ... [k*n, (k+1)*n)
+    // Bits:  1 << 0, 1 << 1,       1 << k
+    //
+    // to avoid overflow, we then do all of this mod 32.
+    int32_t shift = ((pos + quanta - 1) / quanta) % 32;
+    return absl::bit_cast<int32_t>(uint32_t{1} << shift);
   }
 
   // Returns first object of the i-th slot.
   void **GetSlot(size_t i) { return slots_ + i; }
-
-  int32_t slots_size() const { return max_capacity_ + 1; }
 
   size_t size_class() const { return freelist_.size_class(); }
 
@@ -778,19 +1000,21 @@ class LockFreeTransferCache {
   void **slots_;
   FreeList freelist_;
 
-  // Maximum size of the cache for a given size class. (immutable after Init())
+  // Maximum size of the cache for a given size class. (immutable after
+  // Init())
   int32_t max_capacity_;
   int32_t batch_size_;
+  uint32_t slots_mask_;
 
-  alignas(ABSL_CACHELINE_SIZE) std::atomic<int32_t> capacity_;
-  alignas(ABSL_CACHELINE_SIZE) std::atomic<int32_t> head_;
+  alignas(ABSL_CACHELINE_SIZE) std::atomic<uint32_t> capacity_;
+  alignas(ABSL_CACHELINE_SIZE) std::atomic<uint32_t> head_;
   std::atomic<size_t> insert_hits_;
   std::atomic<size_t> insert_misses_;
-  alignas(ABSL_CACHELINE_SIZE) std::atomic<int32_t> head_committed_;
-  alignas(ABSL_CACHELINE_SIZE) std::atomic<int32_t> tail_;
+  alignas(ABSL_CACHELINE_SIZE) SpinValue head_committed_;
+  alignas(ABSL_CACHELINE_SIZE) std::atomic<uint32_t> tail_;
   std::atomic<size_t> remove_hits_;
   std::atomic<size_t> remove_misses_;
-  alignas(ABSL_CACHELINE_SIZE) std::atomic<int32_t> tail_committed_;
+  alignas(ABSL_CACHELINE_SIZE) SpinValue tail_committed_;
 } ABSL_CACHELINE_ALIGNED;
 
 }  // namespace tcmalloc::internal_transfer_cache

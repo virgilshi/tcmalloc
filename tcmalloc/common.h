@@ -22,8 +22,10 @@
 #include <stdint.h>
 
 #include "absl/base/attributes.h"
+#include "absl/base/dynamic_annotations.h"
 #include "absl/base/internal/spinlock.h"
 #include "absl/base/optimization.h"
+#include "absl/strings/string_view.h"
 #include "tcmalloc/internal/bits.h"
 #include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
@@ -98,6 +100,7 @@
 #if TCMALLOC_PAGE_SHIFT == 12
 inline constexpr size_t kPageShift = 12;
 inline constexpr size_t kNumClasses = 46;
+inline constexpr bool kHasExpandedClasses = false;
 inline constexpr size_t kMaxSize = 8 << 10;
 inline constexpr size_t kMinThreadCacheSize = 4 * 1024;
 inline constexpr size_t kMaxThreadCacheSize = 64 * 1024;
@@ -108,7 +111,8 @@ inline constexpr size_t kDefaultProfileSamplingRate = 1 << 19;
 inline constexpr size_t kMinPages = 2;
 #elif TCMALLOC_PAGE_SHIFT == 15
 inline constexpr size_t kPageShift = 15;
-inline constexpr size_t kNumClasses = 78;
+inline constexpr size_t kNumClasses = 2 * 78;
+inline constexpr bool kHasExpandedClasses = true;
 inline constexpr size_t kMaxSize = 256 * 1024;
 inline constexpr size_t kMinThreadCacheSize = kMaxSize * 2;
 inline constexpr size_t kMaxThreadCacheSize = 4 << 20;
@@ -120,7 +124,8 @@ inline constexpr size_t kDefaultProfileSamplingRate = 1 << 21;
 inline constexpr size_t kMinPages = 8;
 #elif TCMALLOC_PAGE_SHIFT == 18
 inline constexpr size_t kPageShift = 18;
-inline constexpr size_t kNumClasses = 89;
+inline constexpr size_t kNumClasses = 2 * 89;
+inline constexpr bool kHasExpandedClasses = true;
 inline constexpr size_t kMaxSize = 256 * 1024;
 inline constexpr size_t kMinThreadCacheSize = kMaxSize * 2;
 inline constexpr size_t kMaxThreadCacheSize = 4 << 20;
@@ -132,7 +137,8 @@ inline constexpr size_t kDefaultProfileSamplingRate = 1 << 21;
 inline constexpr size_t kMinPages = 8;
 #elif TCMALLOC_PAGE_SHIFT == 13
 inline constexpr size_t kPageShift = 13;
-inline constexpr size_t kNumClasses = 86;
+inline constexpr size_t kNumClasses = 2 * 86;
+inline constexpr bool kHasExpandedClasses = true;
 inline constexpr size_t kMaxSize = 256 * 1024;
 inline constexpr size_t kMinThreadCacheSize = kMaxSize * 2;
 inline constexpr size_t kMaxThreadCacheSize = 4 << 20;
@@ -182,33 +188,42 @@ inline constexpr int kMaxOverages = 3;
 // scavenging code will shrink it down when its contents are not in use.
 inline constexpr int kMaxDynamicFreeListLength = 8192;
 
-#if defined __x86_64__
-// All current and planned x86_64 processors only look at the lower 48 bits
-// in virtual to physical address translation.  The top 16 are thus unused.
-// TODO(b/134686025): Under what operating systems can we increase it safely to
-// 17? This lets us use smaller page maps.  On first allocation, a 36-bit page
-// map uses only 96 KB instead of the 4.5 MB used by a 52-bit page map.
-inline constexpr int kAddressBits =
-    (sizeof(void*) < 8 ? (8 * sizeof(void*)) : 48);
-#elif defined __powerpc64__ && defined __linux__
-// Linux(4.12 and above) on powerpc64 supports 128TB user virtual address space
-// by default, and up to 512TB if user space opts in by specifing hint in mmap.
-// See comments in arch/powerpc/include/asm/processor.h
-// and arch/powerpc/mm/mmap.c.
-inline constexpr int kAddressBits =
-    (sizeof(void*) < 8 ? (8 * sizeof(void*)) : 49);
-#elif defined __aarch64__ && defined __linux__
-// According to Documentation/arm64/memory.txt of kernel 3.16,
-// AARCH64 kernel supports 48-bit virtual addresses for both user and kernel.
-inline constexpr int kAddressBits =
-    (sizeof(void*) < 8 ? (8 * sizeof(void*)) : 48);
-#else
-inline constexpr int kAddressBits = 8 * sizeof(void*);
-#endif
-
 namespace tcmalloc {
-inline constexpr uintptr_t kTagMask = uintptr_t{1}
-                                      << std::min(kAddressBits - 4, 42);
+
+enum class MemoryTag : uint8_t {
+  kSampled = 0x0,  // Sampled, infrequently allocated
+  kNormal = 0x1,   // Not sampled
+};
+
+inline constexpr uintptr_t kTagShift = std::min(kAddressBits - 4, 42);
+inline constexpr uintptr_t kTagMask = uintptr_t{0x1} << kTagShift;
+
+// Returns true if ptr is tagged.
+ABSL_DEPRECATED("Replace with specific tests")
+inline bool IsTaggedMemory(const void* ptr) {
+  return (reinterpret_cast<uintptr_t>(ptr) & kTagMask) == 0;
+}
+
+inline bool IsSampledMemory(const void* ptr) {
+  return (reinterpret_cast<uintptr_t>(ptr) & kTagMask) ==
+         (static_cast<uintptr_t>(MemoryTag::kSampled) << kTagShift);
+}
+
+inline bool IsNormalMemory(const void* ptr) {
+  return (reinterpret_cast<uintptr_t>(ptr) & kTagMask) ==
+         (static_cast<uintptr_t>(MemoryTag::kNormal) << kTagShift);
+}
+
+inline MemoryTag GetMemoryTag(const void* ptr) {
+  return static_cast<MemoryTag>((reinterpret_cast<uintptr_t>(ptr) & kTagMask) >>
+                                kTagShift);
+}
+
+absl::string_view MemoryTagToLabel(MemoryTag tag);
+
+inline constexpr bool IsExpandedSizeClass(unsigned cl) {
+  return kHasExpandedClasses && (cl >= kNumClasses / 2);
+}
 
 #if !defined(TCMALLOC_SMALL_BUT_SLOW) && __WORDSIZE != 32
 // Always allocate at least a huge page
@@ -226,11 +241,6 @@ inline constexpr size_t kMinMmapAlloc = 32 << 20;
 static_assert(kMinMmapAlloc % kMinSystemAlloc == 0,
               "Minimum mmap allocation size is not a multiple of"
               " minimum system allocation size");
-
-// Returns true if ptr is tagged.
-inline bool IsTaggedMemory(const void* ptr) {
-  return (reinterpret_cast<uintptr_t>(ptr) & kTagMask) == 0;
-}
 
 // Size-class information + mapping
 class SizeMap {
@@ -277,20 +287,21 @@ class SizeMap {
   // first member so that it inherits the overall alignment of a SizeMap
   // instance.  In particular, if we create a SizeMap instance that's cache-line
   // aligned, this member is also aligned to the width of a cache line.
-  unsigned char class_array_[kClassArraySize];
+  unsigned char class_array_[kClassArraySize * (kHasExpandedClasses ? 2 : 1)] =
+      {0};
 
   // Number of objects to move between a per-thread list and a central
   // list in one shot.  We want this to be not too small so we can
   // amortize the lock overhead for accessing the central list.  Making
   // it too big may temporarily cause unnecessary memory wastage in the
   // per-thread free list until the scavenger cleans up the list.
-  BatchSize num_objects_to_move_[kNumClasses];
+  BatchSize num_objects_to_move_[kNumClasses] = {0};
 
   // If size is no more than kMaxSize, compute index of the
   // class_array[] entry for it, putting the class index in output
   // parameter idx and returning true. Otherwise return false.
-  static inline bool ABSL_ATTRIBUTE_ALWAYS_INLINE ClassIndexMaybe(size_t s,
-                                                                  uint32_t* idx) {
+  static inline bool ABSL_ATTRIBUTE_ALWAYS_INLINE
+  ClassIndexMaybe(size_t s, uint32_t* idx) {
     if (ABSL_PREDICT_TRUE(s <= kMaxSmallSize)) {
       *idx = (static_cast<uint32_t>(s) + 7) >> 3;
       return true;
@@ -308,10 +319,10 @@ class SizeMap {
   }
 
   // Mapping from size class to number of pages to allocate at a time
-  unsigned char class_to_pages_[kNumClasses];
+  unsigned char class_to_pages_[kNumClasses] = {0};
 
   // Mapping from size class to max size storable in that class
-  uint32_t class_to_size_[kNumClasses];
+  uint32_t class_to_size_[kNumClasses] = {0};
 
   // If environment variable defined, use it to override sizes classes.
   // Returns true if all classes defined correctly.
@@ -325,18 +336,21 @@ class SizeMap {
   bool ValidSizeClasses(int num_classes, const SizeClassInfo* parsed);
 
   // Definition of size class that is set in size_classes.cc
-  static const SizeClassInfo kSizeClasses[kNumClasses];
+  static const SizeClassInfo kSizeClasses[];
+  static const int kSizeClassesCount;
 
   // Definition of size class that is set in size_classes.cc
-  static const SizeClassInfo kExperimentalSizeClasses[kNumClasses];
+  static const SizeClassInfo kExperimentalSizeClasses[];
+  static const int kExperimentalSizeClassesCount;
 
   // Definition of size class that is set in size_classes.cc
-  static const SizeClassInfo kExperimental4kSizeClasses[kNumClasses];
+  static const SizeClassInfo kLegacySizeClasses[];
+  static const int kLegacySizeClassesCount;
 
  public:
-  // Constructor should do nothing since we rely on explicit Init()
-  // call, which may or may not be called before the constructor runs.
-  SizeMap() { }
+  // constexpr constructor to guarantee zero-initialization at compile-time.  We
+  // rely on Init() to populate things.
+  constexpr SizeMap() = default;
 
   // Initialize the mapping arrays
   void Init();
@@ -346,6 +360,9 @@ class SizeMap {
   // class value `kMaxSize'.
   // Important: this function may return true with *cl == 0 if this
   // SizeMap instance has not (yet) been initialized.
+  //
+  // TODO(b/171978365): Replace the output parameter with returning
+  // absl::optional<uint32_t>.
   inline bool ABSL_ATTRIBUTE_ALWAYS_INLINE GetSizeClass(size_t size,
                                                         uint32_t* cl) {
     uint32_t idx;
@@ -371,13 +388,15 @@ class SizeMap {
   inline bool ABSL_ATTRIBUTE_ALWAYS_INLINE GetSizeClass(size_t size,
                                                         size_t align,
                                                         uint32_t* cl) {
-    ASSERT(align > 0);
-    ASSERT((align & (align - 1)) == 0);
+    ASSERT(tcmalloc_internal::Bits::IsPow2(align));
 
     if (ABSL_PREDICT_FALSE(align >= kPageSize)) {
+      // TODO(b/172060547): Consider changing this to align > kPageSize.
+      ABSL_ANNOTATE_MEMORY_IS_UNINITIALIZED(cl, sizeof(*cl));
       return false;
     }
     if (ABSL_PREDICT_FALSE(!GetSizeClass(size, cl))) {
+      ABSL_ANNOTATE_MEMORY_IS_UNINITIALIZED(cl, sizeof(*cl));
       return false;
     }
 
@@ -390,6 +409,7 @@ class SizeMap {
       }
     } while (++*cl < kNumClasses);
 
+    ABSL_ANNOTATE_MEMORY_IS_UNINITIALIZED(cl, sizeof(*cl));
     return false;
   }
 

@@ -147,6 +147,7 @@ TEST(StackTraceTableTest, StackTraceTable) {
   t1.depth = static_cast<uintptr_t>(2);
   t1.stack[0] = reinterpret_cast<void*>(1);
   t1.stack[1] = reinterpret_cast<void*>(2);
+  t1.weight = 2 << 20;
 
   const AllocationEntry k1 = {
       1024,
@@ -165,6 +166,7 @@ TEST(StackTraceTableTest, StackTraceTable) {
   t2.depth = static_cast<uintptr_t>(2);
   t2.stack[0] = reinterpret_cast<void*>(2);
   t2.stack[1] = reinterpret_cast<void*>(1);
+  t2.weight = 1;
 
   const AllocationEntry k2 = {
       512,
@@ -186,6 +188,95 @@ TEST(StackTraceTableTest, StackTraceTable) {
     EXPECT_EQ(1, table.bucket_total());
 
     CheckTraces(table, {k1});
+  }
+
+  // We made our last sample at t1.weight (2<<20 bytes).  We sample according to
+  // t1.requested_size + 1 (513 bytes).  Therefore we overweight the sample to
+  // construct the distribution.
+  //
+  // We rely on the profiling tests to verify that this correctly reconstructs
+  // the distribution (+/- an error tolerance)
+  const int t1_sampled_weight =
+      static_cast<double>(t1.weight) / (t1.requested_size + 1);
+  ASSERT_EQ(t1_sampled_weight, 4088);
+  const AllocationEntry k1_unsampled = {
+      t1_sampled_weight * 1024,
+      t1_sampled_weight,
+      512,
+      16,
+      1024,
+      2,
+      {reinterpret_cast<void*>(1), reinterpret_cast<void*>(2)},
+  };
+
+  // Table w/ just t1 (unsampled)
+  {
+    SCOPED_TRACE("t1 unsampled");
+
+    StackTraceTable table(ProfileType::kHeap, 1, true, true);
+    AddTrace(&table, 1.0, t1);
+    EXPECT_EQ(2, table.depth_total());
+    EXPECT_EQ(1, table.bucket_total());
+
+    CheckTraces(table, {k1_unsampled});
+  }
+
+  const AllocationEntry k1_merged = {
+      2048,
+      2,
+      512,
+      16,
+      1024,
+      2,
+      {reinterpret_cast<void*>(1), reinterpret_cast<void*>(2)},
+  };
+
+  // Table w/ 2x t1 (merge)
+  {
+    SCOPED_TRACE("2x t1 merge");
+
+    StackTraceTable table(ProfileType::kHeap, 1, true, false);
+    AddTrace(&table, 1.0, t1);
+    AddTrace(&table, 1.0, t1);
+    EXPECT_EQ(2, table.depth_total());
+    EXPECT_EQ(1, table.bucket_total());
+
+    CheckTraces(table, {k1_merged});
+  }
+
+  // Table w/ 2x t1 (no merge)
+  {
+    SCOPED_TRACE("2x t1 no merge");
+
+    StackTraceTable table(ProfileType::kHeap, 1, false, false);
+    AddTrace(&table, 1.0, t1);
+    AddTrace(&table, 1.0, t1);
+    EXPECT_EQ(4, table.depth_total());
+    EXPECT_EQ(2, table.bucket_total());
+
+    CheckTraces(table, {k1, k1});
+  }
+
+  const AllocationEntry k1_unsampled_merged = {
+      2 * t1_sampled_weight * 1024,
+      2 * t1_sampled_weight,
+      512,
+      16,
+      1024,
+      2,
+      {reinterpret_cast<void*>(1), reinterpret_cast<void*>(2)},
+  };
+
+  {
+    SCOPED_TRACE("2x t1 unsampled");
+
+    StackTraceTable table(ProfileType::kHeap, 1, true, true);
+    AddTrace(&table, 1.0, t1);
+    AddTrace(&table, 1.0, t1);
+    EXPECT_EQ(2, table.depth_total());
+    EXPECT_EQ(1, table.bucket_total());
+
+    CheckTraces(table, {k1_unsampled_merged});
   }
 
   // Table w/ t1, t2
@@ -233,6 +324,7 @@ TEST(StackTraceTableTest, StackTraceTable) {
   t3.depth = static_cast<uintptr_t>(2);
   t3.stack[0] = reinterpret_cast<void*>(1);
   t3.stack[1] = reinterpret_cast<void*>(2);
+  t3.weight = 1;
 
   const AllocationEntry k3 = {
       17,
@@ -265,6 +357,7 @@ TEST(StackTraceTableTest, StackTraceTable) {
   t4.depth = static_cast<uintptr_t>(2);
   t4.stack[0] = reinterpret_cast<void*>(1);
   t4.stack[1] = reinterpret_cast<void*>(2);
+  t4.weight = 1;
 
   const AllocationEntry k4 = {
       1024,

@@ -16,15 +16,17 @@
 
 #include "tcmalloc/internal/percpu.h"
 
-#if PERCPU_RSEQ_SUPPORTED_PLATFORM
+#if TCMALLOC_PERCPU_RSEQ_SUPPORTED_PLATFORM
 #if defined(__x86_64__)
 #include "tcmalloc/internal/percpu_rseq_x86_64.S"
 #elif defined(__ppc__)
 #include "tcmalloc/internal/percpu_rseq_ppc.S"
+#elif defined(__aarch64__)
+#include "tcmalloc/internal/percpu_rseq_aarch64.S"
 #else
 #error "RSEQ support expected, but not found."
 #endif
-#endif // PERCPU_RSEQ_SUPPORTED_PLATFORM
+#endif // TCMALLOC_PERCPU_RSEQ_SUPPORTED_PLATFORM
 
 // We do not need an executable stack. Put this outside the
 // architecture-specific region above in order to suppress "missing

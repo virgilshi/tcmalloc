@@ -18,6 +18,7 @@
 
 #include "absl/base/macros.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "tcmalloc/internal/environment.h"
 #include "tcmalloc/internal/logging.h"
 
@@ -30,7 +31,8 @@ namespace {
 const char kDelimiter = ',';
 const char kExperiments[] = "BORG_EXPERIMENTS";
 const char kDisableExperiments[] = "BORG_DISABLE_EXPERIMENTS";
-const char kDisableAll[] = "all";
+constexpr absl::string_view kEnableAll = "enable-all-known-experiments";
+constexpr absl::string_view kDisableAll = "all";
 
 bool LookupExperimentID(absl::string_view label, Experiment* exp) {
   for (auto config : experiments) {
@@ -46,12 +48,13 @@ bool LookupExperimentID(absl::string_view label, Experiment* exp) {
 const bool* GetSelectedExperiments() {
   static bool by_id[kNumExperiments];
 
-  static const char* active_experiments = thread_safe_getenv(kExperiments);
-  static const char* disabled_experiments =
-      thread_safe_getenv(kDisableExperiments);
-  static const bool* status = internal::SelectExperiments(
-      by_id, active_experiments ? active_experiments : "",
-      disabled_experiments ? disabled_experiments : "");
+  static const bool* status = [&]() {
+    const char* active_experiments = thread_safe_getenv(kExperiments);
+    const char* disabled_experiments = thread_safe_getenv(kDisableExperiments);
+    return internal::SelectExperiments(
+        by_id, active_experiments ? active_experiments : "",
+        disabled_experiments ? disabled_experiments : "");
+  }();
   return status;
 }
 
@@ -80,6 +83,10 @@ namespace internal {
 const bool* SelectExperiments(bool* buffer, absl::string_view active,
                               absl::string_view disabled) {
   memset(buffer, 0, sizeof(*buffer) * kNumExperiments);
+
+  if (active == kEnableAll) {
+    std::fill(buffer, buffer + kNumExperiments, true);
+  }
 
   ParseExperiments(active, [buffer](absl::string_view token) {
     Experiment id;

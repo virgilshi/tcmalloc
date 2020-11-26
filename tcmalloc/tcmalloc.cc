@@ -89,9 +89,11 @@
 #include "tcmalloc/cpu_cache.h"
 #include "tcmalloc/experiment.h"
 #include "tcmalloc/guarded_page_allocator.h"
+#include "tcmalloc/internal/bits.h"
 #include "tcmalloc/internal/linked_list.h"
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/memory_stats.h"
+#include "tcmalloc/internal/optimization.h"
 #include "tcmalloc/internal/percpu.h"
 #include "tcmalloc/internal_malloc_extension.h"
 #include "tcmalloc/malloc_extension.h"
@@ -99,6 +101,7 @@
 #include "tcmalloc/page_heap.h"
 #include "tcmalloc/page_heap_allocator.h"
 #include "tcmalloc/pagemap.h"
+#include "tcmalloc/pages.h"
 #include "tcmalloc/parameters.h"
 #include "tcmalloc/sampler.h"
 #include "tcmalloc/span.h"
@@ -126,6 +129,7 @@ using tcmalloc::kLog;
 using tcmalloc::Length;
 using tcmalloc::Log;
 using tcmalloc::MallocPolicy;
+using tcmalloc::MemoryTag;
 using tcmalloc::pageheap_lock;
 using tcmalloc::PageId;
 using tcmalloc::PageIdContaining;
@@ -140,20 +144,20 @@ using tcmalloc::ThreadCache;
 
 // Extract interesting stats
 struct TCMallocStats {
-  uint64_t thread_bytes;            // Bytes in thread caches
-  uint64_t central_bytes;           // Bytes in central cache
-  uint64_t transfer_bytes;          // Bytes in central transfer cache
-  uint64_t metadata_bytes;          // Bytes alloced for metadata
-  uint64_t per_cpu_bytes;           // Bytes in per-CPU cache
-  uint64_t pagemap_root_bytes_res;  // Resident bytes of pagemap root node
+  uint64_t thread_bytes;               // Bytes in thread caches
+  uint64_t central_bytes;              // Bytes in central cache
+  uint64_t transfer_bytes;             // Bytes in central transfer cache
+  uint64_t metadata_bytes;             // Bytes alloced for metadata
+  uint64_t per_cpu_bytes;              // Bytes in per-CPU cache
+  uint64_t pagemap_root_bytes_res;     // Resident bytes of pagemap root node
   uint64_t percpu_metadata_bytes_res;  // Resident bytes of the per-CPU metadata
-  AllocatorStats tc_stats;          // ThreadCache objects
-  AllocatorStats span_stats;        // Span objects
-  AllocatorStats stack_stats;       // StackTrace objects
-  AllocatorStats bucket_stats;      // StackTraceTable::Bucket objects
-  size_t pagemap_bytes;             // included in metadata bytes
-  size_t percpu_metadata_bytes;     // included in metadata bytes
-  tcmalloc::BackingStats pageheap;  // Stats from page heap
+  AllocatorStats tc_stats;             // ThreadCache objects
+  AllocatorStats span_stats;           // Span objects
+  AllocatorStats stack_stats;          // StackTrace objects
+  AllocatorStats bucket_stats;         // StackTraceTable::Bucket objects
+  size_t pagemap_bytes;                // included in metadata bytes
+  size_t percpu_metadata_bytes;        // included in metadata bytes
+  tcmalloc::BackingStats pageheap;     // Stats from page heap
 };
 
 // Get stats into "r".  Also, if class_count != NULL, class_count[k]
@@ -175,7 +179,7 @@ static void ExtractStats(TCMallocStats* r, uint64_t* class_count,
     const size_t length = Static::transfer_cache().central_length(cl);
     const size_t tc_length = Static::transfer_cache().tc_length(cl);
     const size_t cache_overhead = Static::transfer_cache().OverheadBytes(cl);
-    const size_t size = Static::sizemap()->class_to_size(cl);
+    const size_t size = Static::sizemap().class_to_size(cl);
     r->central_bytes += (size * length) + cache_overhead;
     r->transfer_bytes += (size * tc_length);
     if (class_count) {
@@ -183,7 +187,7 @@ static void ExtractStats(TCMallocStats* r, uint64_t* class_count,
       // freelists, which get counted when we call GetThreadStats(), below.
       class_count[cl] = length + tc_length;
       if (tcmalloc::UsePerCpuCache()) {
-        class_count[cl] += Static::cpu_cache()->TotalObjectsOfClass(cl);
+        class_count[cl] += Static::cpu_cache().TotalObjectsOfClass(cl);
       }
     }
     if (span_stats) {
@@ -196,21 +200,21 @@ static void ExtractStats(TCMallocStats* r, uint64_t* class_count,
 
   // Add stats from per-thread heaps
   r->thread_bytes = 0;
-  { // scope
+  {  // scope
     absl::base_internal::SpinLockHolder h(&pageheap_lock);
     ThreadCache::GetThreadStats(&r->thread_bytes, class_count);
     r->tc_stats = ThreadCache::HeapStats();
-    r->span_stats = Static::span_allocator()->stats();
-    r->stack_stats = Static::stacktrace_allocator()->stats();
-    r->bucket_stats = Static::bucket_allocator()->stats();
+    r->span_stats = Static::span_allocator().stats();
+    r->stack_stats = Static::stacktrace_allocator().stats();
+    r->bucket_stats = Static::bucket_allocator().stats();
     r->metadata_bytes = Static::metadata_bytes();
-    r->pagemap_bytes = Static::pagemap()->bytes();
-    r->pageheap = Static::page_allocator()->stats();
+    r->pagemap_bytes = Static::pagemap().bytes();
+    r->pageheap = Static::page_allocator().stats();
     if (small_spans != nullptr) {
-      Static::page_allocator()->GetSmallSpanStats(small_spans);
+      Static::page_allocator().GetSmallSpanStats(small_spans);
     }
     if (large_spans != nullptr) {
-      Static::page_allocator()->GetLargeSpanStats(large_spans);
+      Static::page_allocator().GetLargeSpanStats(large_spans);
     }
   }
   // We can access the pagemap without holding the pageheap_lock since it
@@ -229,10 +233,10 @@ static void ExtractStats(TCMallocStats* r, uint64_t* class_count,
   r->percpu_metadata_bytes_res = 0;
   r->percpu_metadata_bytes = 0;
   if (tcmalloc::UsePerCpuCache()) {
-    r->per_cpu_bytes = Static::cpu_cache()->TotalUsedBytes();
+    r->per_cpu_bytes = Static::cpu_cache().TotalUsedBytes();
 
     if (report_residence) {
-      auto percpu_metadata = Static::cpu_cache()->MetadataMemoryUsage();
+      auto percpu_metadata = Static::cpu_cache().MetadataMemoryUsage();
       r->percpu_metadata_bytes_res = percpu_metadata.resident_size;
       r->percpu_metadata_bytes = percpu_metadata.virtual_size;
 
@@ -258,12 +262,9 @@ static uint64_t StatSub(uint64_t a, uint64_t b) {
 // Return approximate number of bytes in use by app.
 static uint64_t InUseByApp(const TCMallocStats& stats) {
   return StatSub(stats.pageheap.system_bytes,
-                 stats.thread_bytes +
-                 stats.central_bytes +
-                 stats.transfer_bytes +
-                 stats.per_cpu_bytes +
-                 stats.pageheap.free_bytes +
-                 stats.pageheap.unmapped_bytes);
+                 stats.thread_bytes + stats.central_bytes +
+                     stats.transfer_bytes + stats.per_cpu_bytes +
+                     stats.pageheap.free_bytes + stats.pageheap.unmapped_bytes);
 }
 
 static uint64_t VirtualMemoryUsed(const TCMallocStats& stats) {
@@ -304,8 +305,7 @@ static void DumpStats(TCMalloc_Printer* out, int level) {
   const uint64_t bytes_in_use_by_app = InUseByApp(stats);
 
 #ifdef TCMALLOC_SMALL_BUT_SLOW
-  out->printf(
-      "NOTE:  SMALL MEMORY MODEL IS IN USE, PERFORMANCE MAY SUFFER.\n");
+  out->printf("NOTE:  SMALL MEMORY MODEL IS IN USE, PERFORMANCE MAY SUFFER.\n");
 #endif
   // clang-format off
   // Avoid clang-format complaining about the way that this text is laid out.
@@ -374,7 +374,7 @@ static void DumpStats(TCMalloc_Printer* out, int level) {
   out->printf(
       "MALLOC SAMPLED PROFILES: %zu bytes (current), %zu bytes (peak)\n",
       static_cast<size_t>(tcmalloc::Static::sampled_objects_size_.value()),
-      tcmalloc::Static::peak_heap_tracker()->CurrentPeakSize());
+      tcmalloc::Static::peak_heap_tracker().CurrentPeakSize());
 
   tcmalloc::tcmalloc_internal::MemoryStats memstats;
   if (tcmalloc::tcmalloc_internal::GetMemoryStats(&memstats)) {
@@ -406,16 +406,16 @@ static void DumpStats(TCMalloc_Printer* out, int level) {
     uint64_t cumulative = 0;
     for (int cl = 1; cl < kNumClasses; ++cl) {
       uint64_t class_bytes =
-          class_count[cl] * Static::sizemap()->class_to_size(cl);
+          class_count[cl] * Static::sizemap().class_to_size(cl);
 
       cumulative += class_bytes;
       // clang-format off
       out->printf(
           "class %3d [ %8zu bytes ] : %8" PRIu64 " objs; %5.1f MiB; %5.1f cum MiB; "
           "%8" PRIu64 " live pages; spans: %6zu ret / %6zu req = %5.4f;\n",
-          cl, Static::sizemap()->class_to_size(cl), class_count[cl],
+          cl, Static::sizemap().class_to_size(cl), class_count[cl],
           class_bytes / MiB, cumulative / MiB,
-          span_stats[cl].num_live_spans()*Static::sizemap()->class_to_pages(cl),
+          span_stats[cl].num_live_spans()*Static::sizemap().class_to_pages(cl),
           span_stats[cl].num_spans_returned, span_stats[cl].num_spans_requested,
           span_stats[cl].prob_returned());
       // clang-format on
@@ -428,27 +428,28 @@ static void DumpStats(TCMalloc_Printer* out, int level) {
       out->printf(
           "class %3d [ %8zu bytes ] : %8" PRIu64 " insert hits; %8" PRIu64
           " insert misses; %8" PRIu64 " remove hits; %8" PRIu64 " remove misses;\n",
-          cl, Static::sizemap()->class_to_size(cl), tc_stats[cl].insert_hits,
+          cl, Static::sizemap().class_to_size(cl), tc_stats[cl].insert_hits,
           tc_stats[cl].insert_misses, tc_stats[cl].remove_hits, tc_stats[cl].remove_misses);
       // clang-format on
     }
 
     if (tcmalloc::UsePerCpuCache()) {
-      Static::cpu_cache()->Print(out);
+      Static::cpu_cache().Print(out);
     }
 
-    Static::page_allocator()->Print(out, /*tagged=*/false);
-    Static::page_allocator()->Print(out, /*tagged=*/true);
+    // TODO(ckennelly): Get things into the tcmalloc namespace.
+    Static::page_allocator().Print(out, tcmalloc::MemoryTag::kNormal);
+    Static::page_allocator().Print(out, tcmalloc::MemoryTag::kSampled);
     tcmalloc::tracking::Print(out);
-    Static::guardedpage_allocator()->Print(out);
+    Static::guardedpage_allocator().Print(out);
 
     uint64_t limit_bytes;
     bool is_hard;
-    std::tie(limit_bytes, is_hard) = Static::page_allocator()->limit();
+    std::tie(limit_bytes, is_hard) = Static::page_allocator().limit();
     out->printf("PARAMETER desired_usage_limit_bytes %" PRIu64 " %s\n",
                 limit_bytes, is_hard ? "(hard)" : "");
     out->printf("Number of times limit was hit: %lld\n",
-                Static::page_allocator()->limit_hits());
+                Static::page_allocator().limit_hits());
 
     out->printf("PARAMETER tcmalloc_per_cpu_caches %d\n",
                 tcmalloc::Parameters::per_cpu_caches() ? 1 : 0);
@@ -517,7 +518,7 @@ namespace {
     sampled_profiles.PrintI64("current_bytes",
                               tcmalloc::Static::sampled_objects_size_.value());
     sampled_profiles.PrintI64(
-        "peak_bytes", tcmalloc::Static::peak_heap_tracker()->CurrentPeakSize());
+        "peak_bytes", tcmalloc::Static::peak_heap_tracker().CurrentPeakSize());
   }
 
   // Print total process stats (inclusive of non-malloc sources).
@@ -531,9 +532,9 @@ namespace {
     {
       for (int cl = 1; cl < kNumClasses; ++cl) {
         uint64_t class_bytes =
-            class_count[cl] * Static::sizemap()->class_to_size(cl);
+            class_count[cl] * Static::sizemap().class_to_size(cl);
         PbtxtRegion entry = region.CreateSubRegion("freelist");
-        entry.PrintI64("sizeclass", Static::sizemap()->class_to_size(cl));
+        entry.PrintI64("sizeclass", Static::sizemap().class_to_size(cl));
         entry.PrintI64("bytes", class_bytes);
         entry.PrintI64("num_spans_requested",
                        span_stats[cl].num_spans_requested);
@@ -545,7 +546,7 @@ namespace {
     {
       for (int cl = 1; cl < kNumClasses; ++cl) {
         PbtxtRegion entry = region.CreateSubRegion("transfer_cache");
-        entry.PrintI64("sizeclass", Static::sizemap()->class_to_size(cl));
+        entry.PrintI64("sizeclass", Static::sizemap().class_to_size(cl));
         entry.PrintI64("insert_hits", tc_stats[cl].insert_hits);
         entry.PrintI64("insert_misses", tc_stats[cl].insert_misses);
         entry.PrintI64("remove_hits", tc_stats[cl].remove_hits);
@@ -554,23 +555,23 @@ namespace {
     }
 
     if (tcmalloc::UsePerCpuCache()) {
-      Static::cpu_cache()->PrintInPbtxt(&region);
+      Static::cpu_cache().PrintInPbtxt(&region);
     }
   }
-  Static::page_allocator()->PrintInPbtxt(&region, /*tagged=*/false);
-  Static::page_allocator()->PrintInPbtxt(&region, /*tagged=*/true);
+  Static::page_allocator().PrintInPbtxt(&region, tcmalloc::MemoryTag::kNormal);
+  Static::page_allocator().PrintInPbtxt(&region, tcmalloc::MemoryTag::kSampled);
   // We do not collect tracking information in pbtxt.
 
   size_t limit_bytes;
   bool is_hard;
-  std::tie(limit_bytes, is_hard) = Static::page_allocator()->limit();
+  std::tie(limit_bytes, is_hard) = Static::page_allocator().limit();
   region.PrintI64("desired_usage_limit_bytes", limit_bytes);
   region.PrintBool("hard_limit", is_hard);
-  region.PrintI64("limit_hits", Static::page_allocator()->limit_hits());
+  region.PrintI64("limit_hits", Static::page_allocator().limit_hits());
 
   {
     auto gwp_asan = region.CreateSubRegion("gwp_asan");
-    Static::guardedpage_allocator()->PrintInPbtxt(&gwp_asan);
+    Static::guardedpage_allocator().PrintInPbtxt(&gwp_asan);
   }
 
   region.PrintI64("memory_release_failures", tcmalloc::SystemReleaseErrors());
@@ -660,7 +661,7 @@ DumpFragmentationProfile() {
       // Fetch the span on which the proxy lives so we can examine its
       // co-residents.
       const PageId p = PageIdContaining(t->proxy);
-      Span* span = Static::pagemap()->GetDescriptor(p);
+      Span* span = Static::pagemap().GetDescriptor(p);
       if (span == nullptr) {
         // Avoid crashes in production mode code, but report in tests.
         ASSERT(span != nullptr);
@@ -693,7 +694,7 @@ DumpHeapProfile(bool unsample) {
 
 class AllocationSampleList;
 
-class AllocationSample
+class AllocationSample final
     : public tcmalloc::tcmalloc_internal::AllocationProfilingTokenBase {
  public:
   AllocationSample();
@@ -823,7 +824,7 @@ MallocExtension_Internal_SnapshotCurrent(tcmalloc::ProfileType type) {
     case tcmalloc::ProfileType::kFragmentation:
       return DumpFragmentationProfile().release();
     case tcmalloc::ProfileType::kPeakHeap:
-      return Static::peak_heap_tracker()->DumpSample().release();
+      return Static::peak_heap_tracker().DumpSample().release();
     default:
       return nullptr;
   }
@@ -872,7 +873,7 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
 
   if (name == "generic.heap_size") {
     absl::base_internal::SpinLockHolder l(&pageheap_lock);
-    BackingStats stats = Static::page_allocator()->stats();
+    BackingStats stats = Static::page_allocator().stats();
     *value = stats.system_bytes - stats.unmapped_bytes;
     return true;
   }
@@ -895,7 +896,7 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
     // Kept for backwards compatibility.  Now defined externally as:
     //    pageheap_free_bytes + pageheap_unmapped_bytes.
     absl::base_internal::SpinLockHolder l(&pageheap_lock);
-    BackingStats stats = Static::page_allocator()->stats();
+    BackingStats stats = Static::page_allocator().stats();
     *value = stats.free_bytes + stats.unmapped_bytes;
     return true;
   }
@@ -903,20 +904,20 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
   if (name == "tcmalloc.pageheap_free_bytes" ||
       name == "tcmalloc.page_heap_free") {
     absl::base_internal::SpinLockHolder l(&pageheap_lock);
-    *value = Static::page_allocator()->stats().free_bytes;
+    *value = Static::page_allocator().stats().free_bytes;
     return true;
   }
 
   if (name == "tcmalloc.pageheap_unmapped_bytes" ||
       name == "tcmalloc.page_heap_unmapped") {
     absl::base_internal::SpinLockHolder l(&pageheap_lock);
-    *value = Static::page_allocator()->stats().unmapped_bytes;
+    *value = Static::page_allocator().stats().unmapped_bytes;
     return true;
   }
 
   if (name == "tcmalloc.page_algorithm") {
     absl::base_internal::SpinLockHolder l(&pageheap_lock);
-    *value = Static::page_allocator()->algorithm();
+    *value = Static::page_allocator().algorithm();
     return true;
   }
 
@@ -975,7 +976,7 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
   if (want_hard_limit || name == "tcmalloc.desired_usage_limit_bytes") {
     size_t amount;
     bool is_hard;
-    std::tie(amount, is_hard) = Static::page_allocator()->limit();
+    std::tie(amount, is_hard) = Static::page_allocator().limit();
     if (want_hard_limit != is_hard) {
       amount = std::numeric_limits<size_t>::max();
     }
@@ -1005,7 +1006,7 @@ bool GetNumericProperty(const char* name_data, size_t name_size,
 
 tcmalloc::MallocExtension::Ownership GetOwnership(const void* ptr) {
   const PageId p = PageIdContaining(ptr);
-  return Static::pagemap()->GetDescriptor(p)
+  return Static::pagemap().GetDescriptor(p)
              ? tcmalloc::MallocExtension::Ownership::kOwned
              : tcmalloc::MallocExtension::Ownership::kNotOwned;
 }
@@ -1021,7 +1022,7 @@ extern "C" void MallocExtension_Internal_GetMemoryLimit(
     tcmalloc::MallocExtension::MemoryLimit* limit) {
   ASSERT(limit != nullptr);
 
-  std::tie(limit->limit, limit->hard) = Static::page_allocator()->limit();
+  std::tie(limit->limit, limit->hard) = Static::page_allocator().limit();
 }
 
 extern "C" void MallocExtension_Internal_SetMemoryLimit(
@@ -1030,8 +1031,8 @@ extern "C" void MallocExtension_Internal_SetMemoryLimit(
 
   if (!limit->hard) {
     tcmalloc::Parameters::set_heap_size_hard_limit(0);
-    tcmalloc::Static::page_allocator()->set_limit(limit->limit,
-                                                  false /* !hard */);
+    tcmalloc::Static::page_allocator().set_limit(limit->limit,
+                                                 false /* !hard */);
   } else {
     tcmalloc::Parameters::set_heap_size_hard_limit(limit->limit);
   }
@@ -1085,12 +1086,12 @@ extern "C" void MallocExtension_Internal_ReleaseMemoryToSystem(
     // A sub-page size request may round down to zero.  Assume the caller wants
     // some memory released.
     num_pages = tcmalloc::BytesToLengthCeil(num_bytes);
-    ASSERT(num_pages > 0);
+    ASSERT(num_pages > Length(0));
   } else {
-    num_pages = 0;
+    num_pages = Length(0);
   }
   size_t bytes_released =
-      Static::page_allocator()->ReleaseAtLeastNPages(num_pages) << kPageShift;
+      Static::page_allocator().ReleaseAtLeastNPages(num_pages).in_bytes();
   if (bytes_released > num_bytes) {
     extra_bytes_released = bytes_released - num_bytes;
   } else {
@@ -1110,11 +1111,11 @@ static ABSL_ATTRIBUTE_NOINLINE size_t nallocx_slow(size_t size, int flags) {
   Static::InitIfNecessary();
   size_t align = static_cast<size_t>(1ull << (flags & 0x3f));
   uint32_t cl;
-  if (ABSL_PREDICT_TRUE(Static::sizemap()->GetSizeClass(size, align, &cl))) {
+  if (ABSL_PREDICT_TRUE(Static::sizemap().GetSizeClass(size, align, &cl))) {
     ASSERT(cl != 0);
-    return Static::sizemap()->class_to_size(cl);
+    return Static::sizemap().class_to_size(cl);
   } else {
-    return tcmalloc::BytesToLengthCeil(size) << kPageShift;
+    return tcmalloc::BytesToLengthCeil(size).in_bytes();
   }
 }
 
@@ -1128,11 +1129,11 @@ extern "C" size_t nallocx(size_t size, int flags) noexcept {
     return nallocx_slow(size, flags);
   }
   uint32_t cl;
-  if (ABSL_PREDICT_TRUE(Static::sizemap()->GetSizeClass(size, &cl))) {
+  if (ABSL_PREDICT_TRUE(Static::sizemap().GetSizeClass(size, &cl))) {
     ASSERT(cl != 0);
-    return Static::sizemap()->class_to_size(cl);
+    return Static::sizemap().class_to_size(cl);
   } else {
-    return tcmalloc::BytesToLengthCeil(size) << kPageShift;
+    return tcmalloc::BytesToLengthCeil(size).in_bytes();
   }
 }
 
@@ -1179,7 +1180,7 @@ extern "C" void MallocExtension_Internal_GetProperties(
       stats.pageheap.unmapped_bytes;
 
   (*result)["tcmalloc.page_algorithm"].value =
-      Static::page_allocator()->algorithm();
+      Static::page_allocator().algorithm();
 
   tcmalloc::FillExperimentProperties(result);
   tcmalloc::tracking::GetProperties(result);
@@ -1188,7 +1189,7 @@ extern "C" void MallocExtension_Internal_GetProperties(
 extern "C" size_t MallocExtension_Internal_ReleaseCpuMemory(int cpu) {
   size_t bytes = 0;
   if (Static::CPUCacheActive()) {
-    bytes = Static::cpu_cache()->Reclaim(cpu);
+    bytes = Static::cpu_cache().Reclaim(cpu);
   }
   return bytes;
 }
@@ -1226,7 +1227,7 @@ inline void SetCapacity(size_t size, size_t* psize) { *psize = size; }
 // Sets `*psize` to the size for the size class in `cl`,
 inline void SetClassCapacity(size_t size, std::nullptr_t) {}
 inline void SetClassCapacity(uint32_t cl, size_t* psize) {
-  *psize = Static::sizemap()->class_to_size(cl);
+  *psize = Static::sizemap().class_to_size(cl);
 }
 
 // Sets `*psize` to the size for the size class in `cl` if `ptr` is not null,
@@ -1236,7 +1237,7 @@ inline void SetClassCapacity(uint32_t cl, size_t* psize) {
 inline void SetClassCapacity(const void*, uint32_t, std::nullptr_t) {}
 inline void SetClassCapacity(const void* ptr, uint32_t cl, size_t* psize) {
   if (ABSL_PREDICT_TRUE(ptr != nullptr)) {
-    *psize = Static::sizemap()->class_to_size(cl);
+    *psize = Static::sizemap().class_to_size(cl);
   } else {
     *psize = 0;
   }
@@ -1249,7 +1250,7 @@ inline void SetClassCapacity(const void* ptr, uint32_t cl, size_t* psize) {
 inline void SetPagesCapacity(const void*, size_t, std::nullptr_t) {}
 inline void SetPagesCapacity(const void* ptr, size_t size, size_t* psize) {
   if (ABSL_PREDICT_TRUE(ptr != nullptr)) {
-    *psize = tcmalloc::BytesToLengthCeil(size) << kPageShift;
+    *psize = tcmalloc::BytesToLengthCeil(size).in_bytes();
   } else {
     *psize = 0;
   }
@@ -1296,8 +1297,8 @@ static inline ABSL_ATTRIBUTE_ALWAYS_INLINE void FreeSmall(void* ptr,
   ASSERT(Static::CPUCacheActive());
   ASSERT(tcmalloc::subtle::percpu::IsFastNoInit());
 
-  Static::cpu_cache()->Deallocate(ptr, cl);
-#else   // TCMALLOC_DEPRECATED_PERTHREAD
+  Static::cpu_cache().Deallocate(ptr, cl);
+#else  // TCMALLOC_DEPRECATED_PERTHREAD
   ThreadCache* cache = ThreadCache::GetCacheIfPresent();
 
   // IsOnFastPath does not track whether or not we have an active ThreadCache on
@@ -1324,7 +1325,7 @@ static inline ABSL_ATTRIBUTE_ALWAYS_INLINE void FreeSmall(void* ptr,
 ABSL_ATTRIBUTE_NOINLINE
 static void FreeSmallSlow(void* ptr, size_t cl) {
   if (ABSL_PREDICT_TRUE(tcmalloc::UsePerCpuCache())) {
-    Static::cpu_cache()->Deallocate(ptr, cl);
+    Static::cpu_cache().Deallocate(ptr, cl);
   } else if (ThreadCache* cache = ThreadCache::GetCacheIfPresent()) {
     // TODO(b/134691947):  If we reach this path from the ThreadCache fastpath,
     // we've already checked that UsePerCpuCache is false and cache == nullptr.
@@ -1343,14 +1344,15 @@ namespace {
 // returns a guarded allocation Span.  Otherwise returns nullptr.
 static void* TrySampleGuardedAllocation(size_t size, size_t alignment,
                                         Length num_pages) {
-  if (num_pages == 1 && GetThreadSampler()->ShouldSampleGuardedAllocation()) {
+  if (num_pages == Length(1) &&
+      GetThreadSampler()->ShouldSampleGuardedAllocation()) {
     // The num_pages == 1 constraint ensures that size <= kPageSize.  And since
     // alignments above kPageSize cause cl == 0, we're also guaranteed
     // alignment <= kPageSize
     //
     // In all cases kPageSize <= GPA::page_size_, so Allocate's preconditions
     // are met.
-    return Static::guardedpage_allocator()->Allocate(size, alignment);
+    return Static::guardedpage_allocator().Allocate(size, alignment);
   }
   return nullptr;
 }
@@ -1396,32 +1398,32 @@ static void* SampleifyAllocation(size_t requested_size, size_t weight,
   }
 
   if (cl != 0) {
-    ASSERT(cl == Static::pagemap()->sizeclass(PageIdContaining(obj)));
+    ASSERT(cl == Static::pagemap().sizeclass(PageIdContaining(obj)));
 
-    allocated_size = Static::sizemap()->class_to_size(cl);
+    allocated_size = Static::sizemap().class_to_size(cl);
 
     // If the caller didn't provide a span, allocate one:
     Length num_pages = tcmalloc::BytesToLengthCeil(allocated_size);
     if ((guarded_alloc = TrySampleGuardedAllocation(
              requested_size, requested_alignment, num_pages))) {
-      ASSERT(tcmalloc::IsTaggedMemory(guarded_alloc));
+      ASSERT(tcmalloc::IsSampledMemory(guarded_alloc));
       const PageId p = PageIdContaining(guarded_alloc);
       absl::base_internal::SpinLockHolder h(&pageheap_lock);
       span = Span::New(p, num_pages);
-      Static::pagemap()->Set(p, span);
+      Static::pagemap().Set(p, span);
       // If we report capacity back from a size returning allocation, we can not
       // report the allocated_size, as we guard the size to 'requested_size',
       // and we maintain the invariant that GetAllocatedSize() must match the
       // returned size from size returning allocations. So in that case, we
       // report the requested size for both capacity and GetAllocatedSize().
       if (capacity) allocated_size = requested_size;
-    } else if ((span = Static::page_allocator()->New(
-                    num_pages, /*tagged=*/true)) == nullptr) {
+    } else if ((span = Static::page_allocator().New(
+                    num_pages, MemoryTag::kSampled)) == nullptr) {
       if (capacity) *capacity = allocated_size;
       return obj;
     }
 
-    size_t span_size = Static::sizemap()->class_to_pages(cl) << kPageShift;
+    size_t span_size = Length(Static::sizemap().class_to_pages(cl)).in_bytes();
     size_t objects_per_span = span_size / allocated_size;
 
     if (objects_per_span != 1) {
@@ -1453,7 +1455,7 @@ static void* SampleifyAllocation(size_t requested_size, size_t weight,
   {
     absl::base_internal::SpinLockHolder h(&pageheap_lock);
     // Allocate stack trace
-    StackTrace *stack = Static::stacktrace_allocator()->New();
+    StackTrace* stack = Static::stacktrace_allocator().New();
     if (stack != nullptr) {
       allocation_samples_.ReportMalloc(tmp);
       *stack = tmp;
@@ -1464,7 +1466,7 @@ static void* SampleifyAllocation(size_t requested_size, size_t weight,
   }
 
   if (success) {
-    Static::peak_heap_tracker()->MaybeSaveSample();
+    Static::peak_heap_tracker().MaybeSaveSample();
   }
 
   if (!success) {
@@ -1504,18 +1506,24 @@ inline size_t ShouldSampleAllocation(size_t size) {
   return GetThreadSampler()->RecordAllocation(size);
 }
 
-inline void* do_malloc_pages(size_t size, size_t alignment) {
+inline void* do_malloc_pages(size_t size,
+                             size_t alignment
+) {
   // Page allocator does not deal well with num_pages = 0.
-  Length num_pages = std::max<Length>(tcmalloc::BytesToLengthCeil(size), 1);
+  Length num_pages =
+      std::max<Length>(tcmalloc::BytesToLengthCeil(size), Length(1));
 
-  Span* span = Static::page_allocator()->NewAligned(
-      num_pages, tcmalloc::BytesToLengthCeil(alignment), /*tagged=*/false);
+  MemoryTag tag = MemoryTag::kNormal;
+  Span* span = Static::page_allocator().NewAligned(
+      num_pages, tcmalloc::BytesToLengthCeil(alignment), tag);
 
   if (span == nullptr) {
     return nullptr;
   }
 
   void* result = span->start_address();
+  ASSERT(
+      tag == tcmalloc::GetMemoryTag(span->start_address()));
 
   if (size_t weight = ShouldSampleAllocation(size)) {
     CHECK_CONDITION(result == SampleifyAllocation(size, weight, alignment, 0,
@@ -1533,7 +1541,7 @@ inline void* ABSL_ATTRIBUTE_ALWAYS_INLINE AllocSmall(Policy policy, size_t cl,
   void* result;
 
   if (tcmalloc::UsePerCpuCache()) {
-    result = Static::cpu_cache()->Allocate<Policy::handle_oom>(cl);
+    result = Static::cpu_cache().Allocate<Policy::handle_oom>(cl);
   } else {
     result = ThreadCache::GetCache()->Allocate<Policy::handle_oom>(cl);
   }
@@ -1565,7 +1573,7 @@ static void do_free_pages(void* ptr, const PageId p) {
   size_t size;
   bool notify_sampled_alloc = false;
 
-  Span* span = Static::pagemap()->GetExistingDescriptor(p);
+  Span* span = Static::pagemap().GetExistingDescriptor(p);
   ASSERT(span != nullptr);
   {
     absl::base_internal::SpinLockHolder h(&pageheap_lock);
@@ -1575,25 +1583,25 @@ static void do_free_pages(void* ptr, const PageId p) {
       size = st->allocated_size;
       if (proxy == nullptr && size <= kMaxSize) {
         tcmalloc::tracking::Report(tcmalloc::kFreeMiss,
-                                   Static::sizemap()->SizeClass(size), 1);
+                                   Static::sizemap().SizeClass(size), 1);
       }
       notify_sampled_alloc = true;
-      Static::stacktrace_allocator()->Delete(st);
+      Static::stacktrace_allocator().Delete(st);
     }
-    if (tcmalloc::IsTaggedMemory(ptr)) {
-      if (Static::guardedpage_allocator()->PointerIsMine(ptr)) {
+    if (tcmalloc::IsSampledMemory(ptr)) {
+      if (Static::guardedpage_allocator().PointerIsMine(ptr)) {
         // Release lock while calling Deallocate() since it does a system call.
         pageheap_lock.Unlock();
-        Static::guardedpage_allocator()->Deallocate(ptr);
+        Static::guardedpage_allocator().Deallocate(ptr);
         pageheap_lock.Lock();
         Span::Delete(span);
       } else {
         ASSERT(reinterpret_cast<uintptr_t>(ptr) % kPageSize == 0);
-        Static::page_allocator()->Delete(span, /*tagged=*/true);
+        Static::page_allocator().Delete(span, MemoryTag::kSampled);
       }
     } else {
       ASSERT(reinterpret_cast<uintptr_t>(ptr) % kPageSize == 0);
-      Static::page_allocator()->Delete(span, /*tagged=*/false);
+      Static::page_allocator().Delete(span, MemoryTag::kNormal);
     }
   }
 
@@ -1601,14 +1609,15 @@ static void do_free_pages(void* ptr, const PageId p) {
   }
 
   if (proxy) {
-    FreeSmall<Hooks::NO>(proxy, Static::sizemap()->SizeClass(size));
+    const size_t cl = Static::sizemap().SizeClass(size);
+    FreeSmall<Hooks::NO>(proxy, cl);
   }
 }
 
 #ifndef NDEBUG
 static size_t GetSizeClass(void* ptr) {
   const PageId p = PageIdContaining(ptr);
-  return Static::pagemap()->sizeclass(p);
+  return Static::pagemap().sizeclass(p);
 }
 #endif
 
@@ -1645,12 +1654,12 @@ inline ABSL_ATTRIBUTE_ALWAYS_INLINE void do_free_with_cl(void* ptr, size_t cl) {
   ASSERT(Static::IsInited());
 
   if (!have_cl) {
-    cl = Static::pagemap()->sizeclass(p);
+    cl = Static::pagemap().sizeclass(p);
   }
   if (have_cl || ABSL_PREDICT_TRUE(cl != 0)) {
     ASSERT(cl == GetSizeClass(ptr));
     ASSERT(ptr != nullptr);
-    ASSERT(!Static::pagemap()->GetExistingDescriptor(p)->sampled());
+    ASSERT(!Static::pagemap().GetExistingDescriptor(p)->sampled());
     FreeSmall<hooks_state>(ptr, cl);
   } else {
     tcmalloc::invoke_delete_hooks_and_free<do_free_pages, hooks_state>(ptr, p);
@@ -1689,10 +1698,10 @@ inline ABSL_ATTRIBUTE_ALWAYS_INLINE void do_free_with_size(void* ptr,
   //
   // The optimized path doesn't work with sampled objects, whose deletions
   // trigger more operations and require to visit metadata.
-  if (ABSL_PREDICT_FALSE(tcmalloc::IsTaggedMemory(ptr))) {
-    // we don't know true class size of the ptr
-    if (ptr == nullptr) return;
-    return FreePages(ptr);
+  if (ABSL_PREDICT_FALSE(tcmalloc::IsSampledMemory(ptr))) {
+      // we don't know true class size of the ptr
+      if (ptr == nullptr) return;
+      return FreePages(ptr);
   }
 
   // At this point, since ptr's tag bit is 1, it means that it
@@ -1704,7 +1713,7 @@ inline ABSL_ATTRIBUTE_ALWAYS_INLINE void do_free_with_size(void* ptr,
 
   uint32_t cl;
   if (ABSL_PREDICT_FALSE(
-          !Static::sizemap()->GetSizeClass(size, align.align(), &cl))) {
+          !Static::sizemap().GetSizeClass(size, align.align(), &cl))) {
     // We couldn't calculate the size class, which means size > kMaxSize.
     ASSERT(size > kMaxSize || align.align() > alignof(std::max_align_t));
     static_assert(kMaxSize >= kPageSize, "kMaxSize must be at least kPageSize");
@@ -1717,14 +1726,14 @@ inline ABSL_ATTRIBUTE_ALWAYS_INLINE void do_free_with_size(void* ptr,
 inline size_t GetSize(const void* ptr) {
   if (ptr == nullptr) return 0;
   const PageId p = PageIdContaining(ptr);
-  size_t cl = Static::pagemap()->sizeclass(p);
+  size_t cl = Static::pagemap().sizeclass(p);
   if (cl != 0) {
-    return Static::sizemap()->class_to_size(cl);
+    return Static::sizemap().class_to_size(cl);
   } else {
-    const Span* span = Static::pagemap()->GetExistingDescriptor(p);
+    const Span* span = Static::pagemap().GetExistingDescriptor(p);
     if (span->sampled()) {
-      if (Static::guardedpage_allocator()->PointerIsMine(ptr)) {
-        return Static::guardedpage_allocator()->GetRequestedSize(ptr);
+      if (Static::guardedpage_allocator().PointerIsMine(ptr)) {
+        return Static::guardedpage_allocator().GetRequestedSize(ptr);
       }
       return span->sampled_stack()->allocated_size;
     } else {
@@ -1742,15 +1751,15 @@ bool CorrectSize(void* ptr, size_t size, AlignPolicy align) {
   if (ptr == nullptr) return true;
   uint32_t cl = 0;
   // Round-up passed in size to how much tcmalloc allocates for that size.
-  if (Static::guardedpage_allocator()->PointerIsMine(ptr)) {
-    size = Static::guardedpage_allocator()->GetRequestedSize(ptr);
-  } else if (Static::sizemap()->GetSizeClass(size, align.align(), &cl)) {
-    size = Static::sizemap()->class_to_size(cl);
+  if (Static::guardedpage_allocator().PointerIsMine(ptr)) {
+    size = Static::guardedpage_allocator().GetRequestedSize(ptr);
+  } else if (Static::sizemap().GetSizeClass(size, align.align(), &cl)) {
+    size = Static::sizemap().class_to_size(cl);
   } else {
-    size = tcmalloc::BytesToLengthCeil(size) << kPageShift;
+    size = tcmalloc::BytesToLengthCeil(size).in_bytes();
   }
   size_t actual = GetSize(ptr);
-  if (actual == size) return true;
+  if (ABSL_PREDICT_TRUE(actual == size)) return true;
   Log(kLog, __FILE__, __LINE__, "size check failed", actual, size, cl);
   return false;
 }
@@ -1758,18 +1767,16 @@ bool CorrectSize(void* ptr, size_t size, AlignPolicy align) {
 // Checks that an asserted object <ptr> has <align> alignment.
 bool CorrectAlignment(void* ptr, std::align_val_t alignment) {
   size_t align = static_cast<size_t>(alignment);
-  ASSERT((align & (align - 1)) == 0);
+  ASSERT(tcmalloc::tcmalloc_internal::Bits::IsPow2(align));
   return ((reinterpret_cast<uintptr_t>(ptr) & (align - 1)) == 0);
 }
 
 // Helpers for use by exported routines below or inside debugallocation.cc:
 
-inline void do_malloc_stats() {
-  PrintStats(1);
-}
+inline void do_malloc_stats() { PrintStats(1); }
 
 inline int do_mallopt(int cmd, int value) {
-  return 1;     // Indicates error
+  return 1;  // Indicates error
 }
 
 #ifdef HAVE_STRUCT_MALLINFO
@@ -1783,13 +1790,12 @@ inline struct mallinfo do_mallinfo() {
 
   // Unfortunately, the struct contains "int" field, so some of the
   // size values will be truncated.
-  info.arena     = static_cast<int>(stats.pageheap.system_bytes);
-  info.fsmblks   = static_cast<int>(stats.thread_bytes
-                                    + stats.central_bytes
-                                    + stats.transfer_bytes);
-  info.fordblks  = static_cast<int>(stats.pageheap.free_bytes +
-                                    stats.pageheap.unmapped_bytes);
-  info.uordblks  = static_cast<int>(InUseByApp(stats));
+  info.arena = static_cast<int>(stats.pageheap.system_bytes);
+  info.fsmblks = static_cast<int>(stats.thread_bytes + stats.central_bytes +
+                                  stats.transfer_bytes);
+  info.fordblks = static_cast<int>(stats.pageheap.free_bytes +
+                                   stats.pageheap.unmapped_bytes);
+  info.uordblks = static_cast<int>(InUseByApp(stats));
 
   return info;
 }
@@ -1811,11 +1817,15 @@ static void* ABSL_ATTRIBUTE_SECTION(google_malloc)
   GetThreadSampler()->UpdateFastPathState();
   void* p;
   uint32_t cl;
-  bool is_small = Static::sizemap()->GetSizeClass(size, policy.align(), &cl);
+  bool is_small =
+      Static::sizemap().GetSizeClass(size, policy.align(),
+                                     &cl);
   if (ABSL_PREDICT_TRUE(is_small)) {
     p = AllocSmall(policy, cl, size, capacity);
   } else {
-    p = do_malloc_pages(size, policy.align());
+    p = do_malloc_pages(size,
+                        policy.align()
+    );
     // Set capacity to the exact size for a page allocation.
     // This needs to be revisited if we introduce gwp-asan
     // sampling / guarded allocations to do_malloc_pages().
@@ -1838,7 +1848,9 @@ fast_alloc(Policy policy, size_t size, CapacityPtr capacity = nullptr) {
   // (regardless of size), but in this case should also delegate to the slow
   // path by the fast path check further down.
   uint32_t cl;
-  bool is_small = Static::sizemap()->GetSizeClass(size, policy.align(), &cl);
+  bool is_small =
+      Static::sizemap().GetSizeClass(size, policy.align(),
+                                     &cl);
   if (ABSL_PREDICT_FALSE(!is_small)) {
     return slow_alloc(policy, size, capacity);
   }
@@ -1871,7 +1883,7 @@ fast_alloc(Policy policy, size_t size, CapacityPtr capacity = nullptr) {
   void* ret;
 #ifndef TCMALLOC_DEPRECATED_PERTHREAD
   // The CPU cache should be ready.
-  ret = Static::cpu_cache()->Allocate<Policy::handle_oom>(cl);
+  ret = Static::cpu_cache().Allocate<Policy::handle_oom>(cl);
 #else  // !defined(TCMALLOC_DEPRECATED_PERTHREAD)
   // The ThreadCache should be ready.
   ASSERT(cache != nullptr);
@@ -1938,14 +1950,19 @@ extern "C" ABSL_CACHELINE_ALIGNED void* TCMallocInternalNewAligned(
   return fast_alloc(CppPolicy().AlignAs(alignment), size);
 }
 
+#ifdef TCMALLOC_ALIAS
 extern "C" void* TCMallocInternalNewAligned_nothrow(
     size_t size, std::align_val_t alignment, const std::nothrow_t& nt) noexcept
-// Note: we use malloc rather than new, as we are allowed to return nullptr.
-// The latter crashes in that case.
-#ifdef TCMALLOC_ALIAS
+    // Note: we use malloc rather than new, as we are allowed to return nullptr.
+    // The latter crashes in that case.
     TCMALLOC_ALIAS(TCMallocInternalMalloc_aligned);
 #else
-{
+extern "C" ABSL_ATTRIBUTE_SECTION(
+    google_malloc) void* TCMallocInternalNewAligned_nothrow(size_t size,
+                                                            std::align_val_t
+                                                                alignment,
+                                                            const std::nothrow_t&
+                                                                nt) noexcept {
   return fast_alloc(CppPolicy().Nothrow().AlignAs(alignment), size);
 }
 #endif  // TCMALLOC_ALIAS
@@ -2130,12 +2147,17 @@ extern "C" void TCMallocInternalDeleteNothrow(void* p,
 }
 #endif  // TCMALLOC_ALIAS
 
+#if defined(TCMALLOC_ALIAS) && defined(NDEBUG)
 extern "C" void TCMallocInternalDeleteAligned_nothrow(
     void* p, std::align_val_t alignment, const std::nothrow_t& nt) noexcept
-#if defined(TCMALLOC_ALIAS) && defined(NDEBUG)
     TCMALLOC_ALIAS(TCMallocInternalDelete);
 #else
-{
+extern "C" ABSL_ATTRIBUTE_SECTION(
+    google_malloc) void TCMallocInternalDeleteAligned_nothrow(void* p,
+                                                              std::align_val_t
+                                                                  alignment,
+                                                              const std::nothrow_t&
+                                                                  nt) noexcept {
   ASSERT(CorrectAlignment(p, alignment));
   return TCMallocInternalDelete(p);
 }
@@ -2177,14 +2199,19 @@ extern "C" void* TCMallocInternalNewArrayNothrow(size_t size,
 }
 #endif  // TCMALLOC_ALIAS
 
-extern "C" void* TCMallocInternalNewArrayAligned_nothrow(
-    size_t size, std::align_val_t alignment, const std::nothrow_t&) noexcept
 // Note: we use malloc rather than new, as we are allowed to return nullptr.
 // The latter crashes in that case.
 #if defined(TCMALLOC_ALIAS) && defined(NDEBUG)
+extern "C" void* TCMallocInternalNewArrayAligned_nothrow(
+    size_t size, std::align_val_t alignment, const std::nothrow_t&) noexcept
     TCMALLOC_ALIAS(TCMallocInternalMalloc_aligned);
 #else
-{
+extern "C" ABSL_ATTRIBUTE_SECTION(
+    google_malloc) void* TCMallocInternalNewArrayAligned_nothrow(size_t size,
+                                                                 std::align_val_t
+                                                                     alignment,
+                                                                 const std::
+                                                                     nothrow_t&) noexcept {
   return TCMallocInternalMalloc_aligned(size, alignment);
 }
 #endif
@@ -2219,20 +2246,24 @@ extern "C" void TCMallocInternalDeleteArrayNothrow(
 }
 #endif  // TCMALLOC_ALIAS
 
+#if defined(TCMALLOC_ALIAS) && defined(NDEBUG)
 extern "C" void TCMallocInternalDeleteArrayAligned_nothrow(
     void* p, std::align_val_t alignment, const std::nothrow_t&) noexcept
-#if defined(TCMALLOC_ALIAS) && defined(NDEBUG)
     TCMALLOC_ALIAS(TCMallocInternalDelete);
 #else
-{
+extern "C" ABSL_ATTRIBUTE_SECTION(
+    google_malloc) void TCMallocInternalDeleteArrayAligned_nothrow(void* p,
+                                                                   std::align_val_t
+                                                                       alignment,
+                                                                   const std::
+                                                                       nothrow_t&) noexcept {
   ASSERT(CorrectAlignment(p, alignment));
   return TCMallocInternalDelete(p);
 }
 #endif
 
 extern "C" void* TCMallocInternalMemalign(size_t align, size_t size) noexcept {
-  ASSERT(align != 0);
-  ASSERT((align & (align - 1)) == 0);
+  ASSERT(tcmalloc::tcmalloc_internal::Bits::IsPow2(align));
   return fast_alloc(MallocPolicy().AlignAs(align), size);
 }
 
@@ -2255,8 +2286,7 @@ extern "C" void* TCMallocInternalAlignedAlloc(size_t align,
 extern "C" int TCMallocInternalPosixMemalign(void** result_ptr, size_t align,
                                              size_t size) noexcept {
   if (((align % sizeof(void*)) != 0) ||
-      ((align & (align - 1)) != 0) ||
-      (align == 0)) {
+      !tcmalloc::tcmalloc_internal::Bits::IsPow2(align)) {
     return EINVAL;
   }
   void* result = fast_alloc(MallocPolicy().Nothrow().AlignAs(align), size);
@@ -2279,8 +2309,8 @@ extern "C" void* TCMallocInternalValloc(size_t size) noexcept {
 extern "C" void* TCMallocInternalPvalloc(size_t size) noexcept {
   // Round up size to a multiple of pagesize
   if (pagesize == 0) pagesize = getpagesize();
-  if (size == 0) {     // pvalloc(0) should allocate one page, according to
-    size = pagesize;   // http://man.free4web.biz/man3/libmpatrol.3.html
+  if (size == 0) {    // pvalloc(0) should allocate one page, according to
+    size = pagesize;  // http://man.free4web.biz/man3/libmpatrol.3.html
   }
   size = (size + pagesize - 1) & ~(pagesize - 1);
   return fast_alloc(MallocPolicy().Nothrow().AlignAs(pagesize), size);

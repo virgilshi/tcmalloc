@@ -35,22 +35,14 @@ static std::atomic<bool>* hpaa_subrelease_ptr() {
 // constant initialization for the atomic.  This avoids an initialization order
 // fiasco.
 static std::atomic<int64_t>& skip_subrelease_interval_ns() {
-  static std::atomic<int64_t> v([]() {
-    int64_t ret = 0;
-    if (IsExperimentActive(Experiment::TCMALLOC_SKIP_SUBRELEASE_60SEC_V2)) {
-      ret = absl::ToInt64Nanoseconds(absl::Seconds(60));
-    }
-
-    return ret;
-  }());
-
+  static std::atomic<int64_t> v(absl::ToInt64Nanoseconds(absl::Seconds(60)));
   return v;
 }
 
 uint64_t Parameters::heap_size_hard_limit() {
   size_t amount;
   bool is_hard;
-  std::tie(amount, is_hard) = Static::page_allocator()->limit();
+  std::tie(amount, is_hard) = Static::page_allocator().limit();
   if (!is_hard) {
     amount = 0;
   }
@@ -82,7 +74,7 @@ ABSL_CONST_INIT std::atomic<int32_t> Parameters::max_per_cpu_cache_size_(
 ABSL_CONST_INIT std::atomic<int64_t> Parameters::max_total_thread_cache_bytes_(
     kDefaultOverallThreadCacheSize);
 ABSL_CONST_INIT std::atomic<double>
-    Parameters::peak_sampling_heap_growth_fraction_(1.25);
+    Parameters::peak_sampling_heap_growth_fraction_(1.1);
 ABSL_CONST_INIT std::atomic<bool> Parameters::per_cpu_caches_enabled_(
 #if defined(TCMALLOC_DEPRECATED_PERTHREAD)
     false
@@ -92,8 +84,7 @@ ABSL_CONST_INIT std::atomic<bool> Parameters::per_cpu_caches_enabled_(
 );
 
 ABSL_CONST_INIT std::atomic<int64_t> Parameters::profile_sampling_rate_(
-    kDefaultProfileSamplingRate
-);
+    kDefaultProfileSamplingRate);
 
 absl::Duration Parameters::filler_skip_subrelease_interval() {
   return absl::Nanoseconds(
@@ -185,10 +176,10 @@ void TCMalloc_Internal_SetHeapSizeHardLimit(uint64_t value) {
     active = true;
   }
 
-  bool currently_hard = tcmalloc::Static::page_allocator()->limit().second;
+  bool currently_hard = tcmalloc::Static::page_allocator().limit().second;
   if (active || currently_hard) {
     // Avoid resetting limit when current limit is soft.
-    tcmalloc::Static::page_allocator()->set_limit(limit, active /* is_hard */);
+    tcmalloc::Static::page_allocator().set_limit(limit, active /* is_hard */);
     Log(tcmalloc::kLog, __FILE__, __LINE__,
         "[tcmalloc] set page heap hard limit to", limit, "bytes");
   }

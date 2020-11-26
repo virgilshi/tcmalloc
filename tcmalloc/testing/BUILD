@@ -18,7 +18,7 @@
 # Tests for tcmalloc, including a performance test.
 
 load("//tcmalloc:copts.bzl", "TCMALLOC_DEFAULT_COPTS")
-load("//tcmalloc:variants.bzl", "create_tcmalloc_testsuite")
+load("//tcmalloc:variants.bzl", "create_tcmalloc_benchmark", "create_tcmalloc_testsuite")
 
 licenses(["notice"])  # Apache 2.0
 
@@ -37,6 +37,7 @@ REGTEST_DEPS = [
     "@com_google_absl//absl/strings:str_format",
     "@com_google_absl//absl/synchronization",
     "@com_google_absl//absl/utility",
+    "//tcmalloc/internal:bits",
     "//tcmalloc/internal:declarations",
     "//tcmalloc:malloc_extension",
 ]
@@ -81,73 +82,35 @@ cc_library(
     ],
 )
 
-cc_test(
+create_tcmalloc_testsuite(
     name = "tcmalloc_test",
     timeout = "long",
     srcs = ["tcmalloc_test.cc"],
     copts = REGTEST_OPTS,
     linkstatic = 1,  # get the most realistic performance
-    malloc = "//tcmalloc",
     tags = [
         "noasan",
         "nomsan",
         "notsan",
     ],
+    visibility = ["//visibility:private"],
+    deps = REGTEST_DEPS + ["@com_github_google_benchmark//:benchmark"],
+)
+
+create_tcmalloc_benchmark(
+    name = "tcmalloc_benchmark",
+    srcs = ["tcmalloc_benchmark.cc"],
+    copts = TCMALLOC_DEFAULT_COPTS,
+    malloc = "//tcmalloc",
     visibility = [
         "//visibility:private",
     ],
-    deps = REGTEST_DEPS + ["@com_github_google_benchmark//:benchmark"],
-)
-
-cc_test(
-    name = "tcmalloc_test_small_but_slow",
-    srcs = ["tcmalloc_test.cc"],
-    copts = [
-        "-DTCMALLOC_SMALL_BUT_SLOW",
-    ] + REGTEST_OPTS,
-    linkstatic = 1,  # get the most realistic performance
-    malloc = "//tcmalloc:tcmalloc_small_but_slow",
-    tags = [
-        "noasan",
-        "nomsan",
-        "notsan",
+    deps = [
+        "//tcmalloc:malloc_extension",
+        "//tcmalloc/internal:declarations",
+        "@com_github_google_benchmark//:benchmark",
+        "@com_google_absl//absl/random",
     ],
-    deps = REGTEST_DEPS + ["@com_github_google_benchmark//:benchmark"],
-)
-
-cc_test(
-    name = "tcmalloc_test_large_page",
-    timeout = "long",
-    srcs = ["tcmalloc_test.cc"],
-    copts = [
-        "-DTCMALLOC_LARGE_PAGES",
-    ] + REGTEST_OPTS,
-    linkstatic = 1,  # get the most realistic performance
-    malloc = "//tcmalloc:tcmalloc_large_pages",
-    shard_count = 2,
-    tags = [
-        "noasan",
-        "nomsan",
-        "notsan",
-    ],
-    deps = REGTEST_DEPS + ["@com_github_google_benchmark//:benchmark"],
-)
-
-cc_test(
-    name = "tcmalloc_test_256k_pages",
-    timeout = "long",
-    srcs = ["tcmalloc_test.cc"],
-    copts = [
-        "-DTCMALLOC_256K_PAGES",
-    ] + REGTEST_OPTS,
-    linkstatic = 1,  # get the most realistic performance
-    malloc = "//tcmalloc:tcmalloc_256k_pages",
-    tags = [
-        "noasan",
-        "nomsan",
-        "notsan",
-    ],
-    deps = REGTEST_DEPS + ["@com_github_google_benchmark//:benchmark"],
 )
 
 cc_test(
@@ -262,8 +225,7 @@ cc_test(
         "notsan",
     ],
     deps = [
-        "//tcmalloc",
-        "//tcmalloc:headers_for_tests",
+        "//tcmalloc:common",
         "//tcmalloc:malloc_extension",
         "@com_github_google_benchmark//:benchmark",
         "@com_google_googletest//:gtest_main",
@@ -296,7 +258,7 @@ cc_library(
     name = "thread_manager",
     testonly = 1,
     hdrs = ["thread_manager.h"],
-    visibility = ["//tcmalloc:__subpackages__"],
+    visibility = ["//tcmalloc:tcmalloc_tests"],
     deps = [
         "@com_google_absl//absl/synchronization",
         "@com_google_googletest//:gtest",
@@ -369,7 +331,6 @@ create_tcmalloc_testsuite(
         "notsan",
     ],
     deps = [
-        "//tcmalloc:headers_for_tests",
         "//tcmalloc:malloc_extension",
         "//tcmalloc/internal:logging",
         "//tcmalloc/internal:util",
@@ -395,8 +356,7 @@ cc_test(
     ],
     deps = [
         ":testutil",
-        "//tcmalloc",
-        "//tcmalloc:headers_for_tests",
+        "//tcmalloc:common",
         "//tcmalloc:malloc_extension",
         "@com_github_google_benchmark//:benchmark",
         "@com_google_absl//absl/base:core_headers",
@@ -433,7 +393,7 @@ cc_test(
     linkstatic = 1,
     malloc = "//tcmalloc",
     deps = [
-        "//tcmalloc:headers_for_tests",
+        "//tcmalloc:common",
         "//tcmalloc:malloc_extension",
         "@com_github_google_benchmark//:benchmark",
         "@com_google_googletest//:gtest_main",
@@ -474,7 +434,6 @@ cc_test(
         "notsan",
     ],
     deps = [
-        "//tcmalloc",
         "//tcmalloc:malloc_extension",
         "//tcmalloc/internal:linked_list",
         "//tcmalloc/internal:logging",
@@ -509,6 +468,18 @@ cc_library(
     ],
 )
 
+create_tcmalloc_benchmark(
+    name = "empirical_benchmark",
+    srcs = ["empirical_benchmark.cc"],
+    copts = TCMALLOC_DEFAULT_COPTS,
+    malloc = "//tcmalloc",
+    deps = [
+        ":empirical",
+        ":testutil",
+        "@com_github_google_benchmark//:benchmark",
+    ],
+)
+
 cc_test(
     name = "empirical_test",
     srcs = ["empirical_test.cc"],
@@ -539,14 +510,14 @@ cc_library(
     ],
 )
 
-cc_binary(
+create_tcmalloc_benchmark(
     name = "empirical_distributions_benchmark",
-    testonly = 1,
     srcs = ["empirical_distributions_benchmark.cc"],
+    malloc = "//tcmalloc",
     deps = [
         ":empirical_distributions",
         ":testutil",
-        "@com_github_google_benchmark//:benchmark_main",
+        "@com_github_google_benchmark//:benchmark",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/random",
         "@com_google_absl//absl/random:distributions",
@@ -621,7 +592,7 @@ cc_test(
     ],
     deps = [
         ":testutil",
-        "//tcmalloc:headers_for_tests",
+        "//tcmalloc:common",
         "//tcmalloc:malloc_extension",
         "//tcmalloc:want_no_hpaa",
         "//tcmalloc/internal:logging",
@@ -648,7 +619,7 @@ cc_test(
     ],
     deps = [
         ":testutil",
-        "//tcmalloc:headers_for_tests",
+        "//tcmalloc:common",
         "//tcmalloc:malloc_extension",
         "//tcmalloc:want_hpaa",
         "//tcmalloc/internal:logging",
@@ -771,5 +742,17 @@ cc_binary(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:optional",
+    ],
+)
+
+cc_library(
+    name = "benchmark_main",
+    srcs = ["benchmark_main.cc"],
+    copts = TCMALLOC_DEFAULT_COPTS,
+    visibility = [
+        "//tcmalloc:__subpackages__",
+    ],
+    deps = [
+        "@com_github_google_benchmark//:benchmark",
     ],
 )

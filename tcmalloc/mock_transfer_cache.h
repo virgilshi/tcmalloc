@@ -34,6 +34,7 @@ class FakeTransferCacheManagerBase {
  public:
   constexpr static size_t class_to_size(int size_class) { return kClassSize; }
   constexpr static size_t num_objects_to_move(int size_class) {
+    // TODO(b/170732338): test with multiple different num_objects_to_move
     return kNumToMove;
   }
   void* Alloc(size_t size) {
@@ -116,30 +117,33 @@ class FakeTransferCacheEnvironment {
     cache_.Init(1);
   }
 
-  ~FakeTransferCacheEnvironment() {
-    Drain();
-  }
+  ~FakeTransferCacheEnvironment() { Drain(); }
 
   void Shrink() { cache_.ShrinkCache(); }
   void Grow() { cache_.GrowCache(); }
 
   void Insert(int n) {
-    void* bufs[kMaxObjectsToMove];
+    std::vector<void*> bufs;
     while (n > 0) {
       int b = std::min(n, kBatchSize);
-      central_freelist().AllocateBatch(bufs, b);
-      cache_.InsertRange(bufs, b);
+      bufs.resize(b);
+      central_freelist().AllocateBatch(&bufs[0], b);
+      cache_.InsertRange(absl::MakeSpan(bufs), b);
       n -= b;
     }
   }
 
   void Remove(int n) {
-    void* bufs[kMaxObjectsToMove];
+    std::vector<void*> bufs;
     while (n > 0) {
       int b = std::min(n, kBatchSize);
-      cache_.RemoveRange(bufs, b);
-      central_freelist().FreeBatch(bufs, b);
-      n -= b;
+      bufs.resize(b);
+      int removed = cache_.RemoveRange(&bufs[0], b);
+      // Ensure we make progress.
+      ASSERT_GT(removed, 0);
+      ASSERT_LE(removed, b);
+      central_freelist().FreeBatch(&bufs[0], removed);
+      n -= removed;
     }
   }
 

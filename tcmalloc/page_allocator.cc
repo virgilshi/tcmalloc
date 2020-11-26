@@ -73,14 +73,14 @@ bool want_hpaa() {
 PageAllocator::PageAllocator() {
   const bool kUseHPAA = want_hpaa();
   if (kUseHPAA) {
-    untagged_impl_ =
-        new (&choices_[0].hpaa) HugePageAwareAllocator(/*tagged=*/false);
-    tagged_impl_ =
-        new (&choices_[1].hpaa) HugePageAwareAllocator(/*tagged=*/true);
+    normal_impl_ =
+        new (&choices_[0].hpaa) HugePageAwareAllocator(MemoryTag::kNormal);
+    sampled_impl_ =
+        new (&choices_[1].hpaa) HugePageAwareAllocator(MemoryTag::kSampled);
     alg_ = HPAA;
   } else {
-    untagged_impl_ = new (&choices_[0].ph) PageHeap(/*tagged=*/false);
-    tagged_impl_ = new (&choices_[1].ph) PageHeap(/*tagged=*/true);
+    normal_impl_ = new (&choices_[0].ph) PageHeap(MemoryTag::kNormal);
+    sampled_impl_ = new (&choices_[1].ph) PageHeap(MemoryTag::kSampled);
     alg_ = PAGE_HEAP;
   }
 }
@@ -98,7 +98,7 @@ void PageAllocator::ShrinkToUsageLimit() {
 
   limit_hits_++;
   const size_t overage = backed - limit_;
-  const Length pages = (overage + kPageSize - 1) / kPageSize;
+  const Length pages = LengthFromBytes(overage + kPageSize - 1);
   if (ShrinkHardBy(pages)) {
     return;
   }
@@ -141,12 +141,14 @@ bool PageAllocator::ShrinkHardBy(Length pages) {
           limit_, "without breaking hugepages - performance will drop");
       warned_hugepages = true;
     }
-    ret += static_cast<HugePageAwareAllocator *>(untagged_impl_)
+    ret += static_cast<HugePageAwareAllocator *>(normal_impl_)
                ->ReleaseAtLeastNPagesBreakingHugepages(pages - ret);
-    if (ret < pages) {
-      ret += static_cast<HugePageAwareAllocator *>(tagged_impl_)
-                 ->ReleaseAtLeastNPagesBreakingHugepages(pages - ret);
+    if (ret >= pages) {
+      return true;
     }
+
+    ret += static_cast<HugePageAwareAllocator *>(sampled_impl_)
+               ->ReleaseAtLeastNPagesBreakingHugepages(pages - ret);
   }
   // Return "true", if we got back under the limit.
   return (pages <= ret);

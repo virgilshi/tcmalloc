@@ -124,8 +124,11 @@ class AddressRegion {
 class AddressRegionFactory {
  public:
   enum class UsageHint {
-    kNormal,      // Normal usage.
-    kInfrequent,  // Used less frequently than normal regions.
+    kNormal,                // Normal usage.
+    kInfrequentAllocation,  // TCMalloc allocates from these regions less
+                            // frequently than normal regions.
+    kInfrequent ABSL_DEPRECATED("Use kInfrequentAllocation") =
+        kInfrequentAllocation,
   };
 
   AddressRegionFactory() {}
@@ -359,11 +362,7 @@ class MallocExtension final {
   // new, or new[], and must refer to memory that is currently allocated (so,
   // for instance, you should not pass in a pointer after having called free()
   // on it).
-  enum class Ownership {
-    kUnknown = 0,
-    kOwned,
-    kNotOwned
-  };
+  enum class Ownership { kUnknown = 0, kOwned, kNotOwned };
   static Ownership GetOwnership(const void* p);
 
   // Type used by GetProperties.  See comment on GetProperties.

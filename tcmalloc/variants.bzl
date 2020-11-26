@@ -39,6 +39,15 @@ variants = [
         "deps": ["//tcmalloc:common_small_but_slow"],
         "copts": ["-DTCMALLOC_SMALL_BUT_SLOW"],
     },
+    {
+        "name": "legacy_spans",
+        "malloc": "//tcmalloc",
+        "deps": [
+            "//tcmalloc:common",
+            "//tcmalloc:want_legacy_spans",
+        ],
+        "copts": [],
+    },
 ]
 
 # Declare an individual test.
@@ -81,3 +90,17 @@ def create_tcmalloc_testsuite(name, srcs, **kwargs):
         )
 
     native.test_suite(name = name, tests = test_suite_targets)
+
+def create_tcmalloc_benchmark(name, srcs, **kwargs):
+    deps = kwargs.pop("deps")
+    malloc = kwargs.pop("malloc", "//tcmalloc")
+
+    native.cc_binary(
+        name = name,
+        srcs = srcs,
+        malloc = malloc,
+        testonly = 1,
+        linkstatic = 1,
+        deps = deps + ["//tcmalloc/testing:benchmark_main"],
+        **kwargs
+    )

@@ -15,10 +15,22 @@
 #include "tcmalloc/common.h"
 
 #include "tcmalloc/experiment.h"
+#include "tcmalloc/internal/optimization.h"
 #include "tcmalloc/runtime_size_classes.h"
 #include "tcmalloc/sampler.h"
 
 namespace tcmalloc {
+
+absl::string_view MemoryTagToLabel(MemoryTag tag) {
+  switch (tag) {
+    case MemoryTag::kNormal:
+      return "NORMAL";
+    case MemoryTag::kSampled:
+      return "SAMPLED";
+    default:
+      ASSUME(false);
+  }
+}
 
 // Load sizes classes from environment variable if present
 // and valid, then returns True. If not found or valid, returns
@@ -30,11 +42,11 @@ bool SizeMap::MaybeRunTimeSizeClasses() {
     return false;
   }
 
-  if (num_classes != kNumClasses) {
-    // TODO(b/122839049) - Add tests for num_classes < kNumClasses before
+  if (num_classes != kSizeClassesCount) {
+    // TODO(b/122839049) - Add tests for num_classes < kSizeClassesCount before
     // allowing that case.
     Log(kLog, __FILE__, __LINE__, "Can't change the number of size classes",
-        num_classes, kNumClasses);
+        num_classes, kSizeClassesCount);
     return false;
   }
 
@@ -54,16 +66,11 @@ void SizeMap::SetSizeClasses(int num_classes, const SizeClassInfo* parsed) {
     num_objects_to_move_[c] = parsed[c].num_to_move;
   }
 
-  // Fill any unspecified size classes with the largest size
-  // from the static definitions.
+  // Fill any unspecified size classes with 0.
   for (int x = num_classes; x < kNumClasses; x++) {
-    class_to_size_[x] = kSizeClasses[kNumClasses - 1].size;
-    class_to_pages_[x] = kSizeClasses[kNumClasses - 1].pages;
-    auto num_to_move = kSizeClasses[kNumClasses - 1].num_to_move;
-    if (IsExperimentActive(Experiment::TCMALLOC_LARGE_NUM_TO_MOVE)) {
-      num_to_move = std::min(kMaxObjectsToMove, 4 * num_to_move);
-    }
-    num_objects_to_move_[x] = num_to_move;
+    class_to_size_[x] = 0;
+    class_to_pages_[x] = 0;
+    num_objects_to_move_[x] = 0;
   }
 }
 
@@ -73,6 +80,10 @@ bool SizeMap::ValidSizeClasses(int num_classes, const SizeClassInfo* parsed) {
   if (num_classes <= 0) {
     return false;
   }
+  if (kHasExpandedClasses && num_classes > kNumClasses / 2) {
+    num_classes = kNumClasses / 2;
+  }
+
   for (int c = 1; c < num_classes; c++) {
     size_t class_size = parsed[c].size;
     size_t pages = parsed[c].pages;
@@ -124,6 +135,8 @@ bool SizeMap::ValidSizeClasses(int num_classes, const SizeClassInfo* parsed) {
   return true;
 }
 
+int ABSL_ATTRIBUTE_WEAK default_want_legacy_spans();
+
 // Initialize the mapping arrays
 void SizeMap::Init() {
   // Do some sanity checking on add_amount[]/shift_amount[]/class_array[]
@@ -139,11 +152,14 @@ void SizeMap::Init() {
   static_assert(kAlignment <= 16, "kAlignment is too large");
 
   if (IsExperimentActive(Experiment::TCMALLOC_SANS_56_SIZECLASS)) {
-    SetSizeClasses(kNumClasses, kExperimentalSizeClasses);
-  } else if (IsExperimentActive(Experiment::TCMALLOC_4K_SIZE_CLASS)) {
-    SetSizeClasses(kNumClasses, kExperimental4kSizeClasses);
+    SetSizeClasses(kExperimentalSizeClassesCount, kExperimentalSizeClasses);
   } else {
-    SetSizeClasses(kNumClasses, kSizeClasses);
+    if (default_want_legacy_spans != nullptr &&
+        default_want_legacy_spans() > 0) {
+      SetSizeClasses(kLegacySizeClassesCount, kLegacySizeClasses);
+    } else {
+      SetSizeClasses(kSizeClassesCount, kSizeClasses);
+    }
   }
   MaybeRunTimeSizeClasses();
 

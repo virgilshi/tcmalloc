@@ -56,15 +56,15 @@ void TryAllocMightFail(size_t size) {
     unsigned char volatile* vp = p;  // prevent optimizations
     static const size_t kPoints = 1024;
 
-    for ( size_t i = 0; i < kPoints; ++i ) {
+    for (size_t i = 0; i < kPoints; ++i) {
       vp[i * (size / kPoints)] = static_cast<unsigned char>(i);
     }
 
-    for ( size_t i = 0; i < kPoints; ++i ) {
+    for (size_t i = 0; i < kPoints; ++i) {
       ASSERT_EQ(vp[i * (size / kPoints)], static_cast<unsigned char>(i));
     }
 
-    vp[size-1] = 'M';
+    vp[size - 1] = 'M';
     ASSERT_EQ(vp[size - 1], 'M');
   } else {
     ASSERT_EQ(errno, ENOMEM);
@@ -121,7 +121,7 @@ class LargeAllocationTest : public ::testing::Test {
     small_ = ::operator new(4 << 20);
   }
 
-  ~LargeAllocationTest() {
+  ~LargeAllocationTest() override {
     ::operator delete(small_);
 
     auto* current = MallocExtension::GetRegionFactory();

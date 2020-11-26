@@ -25,6 +25,7 @@
 #include "tcmalloc/common.h"
 #include "tcmalloc/internal/linked_list.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/internal/optimization.h"
 #include "tcmalloc/pages.h"
 
 namespace tcmalloc {
@@ -167,10 +168,11 @@ class Span : public SpanList::Elem {
   // Prefetch cacheline containing most important span information.
   void Prefetch();
 
+  static constexpr size_t kCacheSize = 4;
+
  private:
   // See the comment on freelist organization in cc file.
   typedef uint16_t ObjIdx;
-  static constexpr size_t kCacheSize = 4;
   static constexpr ObjIdx kListEnd = -1;
 
   // Use uint16_t or uint8_t for 16 bit and 8 bit fields instead of bitfields.
@@ -210,16 +212,16 @@ class Span : public SpanList::Elem {
   ObjIdx PtrToIdx(void* ptr, size_t size) const;
   ObjIdx* IdxToPtr(ObjIdx idx, size_t size) const;
 
-  template <unsigned int large>
+  enum Align { SMALL, LARGE };
+
+  template <Align align>
   ObjIdx* IdxToPtrSized(ObjIdx idx, size_t size) const;
 
-  template <unsigned int large>
+  template <Align align>
   size_t FreelistPopBatchSized(void** __restrict batch, size_t N, size_t size);
-
-  enum Align { SMALL, LARGE };
 };
 
-template <unsigned int align>
+template <Span::Align align>
 Span::ObjIdx* Span::IdxToPtrSized(ObjIdx idx, size_t size) const {
   ASSERT(idx != kListEnd);
   ASSERT(align == Align::LARGE || align == Align::SMALL);
@@ -233,13 +235,14 @@ Span::ObjIdx* Span::IdxToPtrSized(ObjIdx idx, size_t size) const {
   return ptr;
 }
 
-template <unsigned int align>
+template <Span::Align align>
 size_t Span::FreelistPopBatchSized(void** __restrict batch, size_t N,
                                    size_t size) {
   size_t result = 0;
 
   // Pop from cache.
   auto csize = cache_size_;
+  ASSUME(csize <= kCacheSize);
   auto cache_reads = csize < N ? csize : N;
   for (; result < cache_reads; result++) {
     batch[result] = IdxToPtrSized<align>(cache_[csize - result - 1], size);
@@ -306,7 +309,9 @@ inline bool Span::sampled() const { return sampled_; }
 
 inline PageId Span::first_page() const { return first_page_; }
 
-inline PageId Span::last_page() const { return first_page_ + num_pages_ - 1; }
+inline PageId Span::last_page() const {
+  return first_page_ + num_pages_ - Length(1);
+}
 
 inline void Span::set_first_page(PageId p) { first_page_ = p; }
 
@@ -316,7 +321,7 @@ inline Length Span::num_pages() const { return num_pages_; }
 
 inline void Span::set_num_pages(Length len) { num_pages_ = len; }
 
-inline size_t Span::bytes_in_span() const { return num_pages_ << kPageShift; }
+inline size_t Span::bytes_in_span() const { return num_pages_.in_bytes(); }
 
 inline void Span::set_freelist_added_time(uint64_t t) {
   freelist_added_time_ = t;

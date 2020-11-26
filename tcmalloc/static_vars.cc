@@ -42,16 +42,17 @@ namespace tcmalloc {
 ABSL_CONST_INIT absl::base_internal::SpinLock pageheap_lock(
     absl::kConstInit, absl::base_internal::SCHEDULE_KERNEL_ONLY);
 ABSL_CONST_INIT Arena Static::arena_;
-SizeMap ABSL_CACHELINE_ALIGNED Static::sizemap_;
+ABSL_CONST_INIT SizeMap ABSL_CACHELINE_ALIGNED Static::sizemap_;
 ABSL_CONST_INIT TransferCacheManager Static::transfer_cache_;
 CPUCache ABSL_CACHELINE_ALIGNED Static::cpu_cache_;
-PageHeapAllocator<Span> Static::span_allocator_;
-PageHeapAllocator<StackTrace> Static::stacktrace_allocator_;
-PageHeapAllocator<ThreadCache> Static::threadcache_allocator_;
+ABSL_CONST_INIT PageHeapAllocator<Span> Static::span_allocator_;
+ABSL_CONST_INIT PageHeapAllocator<StackTrace> Static::stacktrace_allocator_;
+ABSL_CONST_INIT PageHeapAllocator<ThreadCache> Static::threadcache_allocator_;
 ABSL_CONST_INIT SpanList Static::sampled_objects_;
 ABSL_CONST_INIT tcmalloc_internal::StatsCounter Static::sampled_objects_size_;
 ABSL_CONST_INIT PeakHeapTracker Static::peak_heap_tracker_;
-PageHeapAllocator<StackTraceTable::Bucket> Static::bucket_allocator_;
+ABSL_CONST_INIT PageHeapAllocator<StackTraceTable::Bucket>
+    Static::bucket_allocator_;
 ABSL_CONST_INIT std::atomic<bool> Static::inited_{false};
 bool Static::cpu_cache_active_;
 Static::PageAllocatorStorage Static::page_allocator_;
@@ -74,7 +75,7 @@ size_t Static::metadata_bytes() {
       sizeof(peak_heap_tracker_) + sizeof(guarded_page_lock) +
       sizeof(guardedpage_allocator_);
 
-  const size_t allocated = arena()->bytes_allocated() +
+  const size_t allocated = arena().bytes_allocated() +
                            AddressRegionFactory::InternalBytesAllocated();
   return allocated + static_var_size;
 }

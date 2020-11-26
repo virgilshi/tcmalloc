@@ -23,6 +23,7 @@
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/page_heap_allocator.h"
 #include "tcmalloc/pagemap.h"
+#include "tcmalloc/pages.h"
 #include "tcmalloc/sampler.h"
 #include "tcmalloc/static_vars.h"
 
@@ -58,13 +59,13 @@ StackTrace* Span::Unsample() {
 }
 
 double Span::Fragmentation() const {
-  const size_t cl = Static::pagemap()->sizeclass(first_page_);
+  const size_t cl = Static::pagemap().sizeclass(first_page_);
   if (cl == 0) {
     // Avoid crashes in production mode code, but report in tests.
     ASSERT(cl != 0);
     return 0;
   }
-  const size_t obj_size = Static::sizemap()->class_to_size(cl);
+  const size_t obj_size = Static::sizemap().class_to_size(cl);
   const size_t span_objects = bytes_in_span() / obj_size;
   const size_t live = allocated_;
   if (live == 0) {
@@ -187,7 +188,7 @@ bool Span::FreelistPush(void* ptr, size_t size) {
     ObjIdx* host;
     if (size <= SizeMap::kMultiPageSize) {
       // Avoid loading first_page_ in this case (see the comment in PtrToIdx).
-      ASSERT(num_pages_ == 1);
+      ASSERT(num_pages_ == Length(1));
       host = reinterpret_cast<ObjIdx*>(
           (reinterpret_cast<uintptr_t>(ptr) & ~(kPageSize - 1)) +
           static_cast<uintptr_t>(freelist_) * kAlignment);

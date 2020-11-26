@@ -15,6 +15,7 @@
 # Internal libraries used for the implementation and testing of TCMalloc.
 
 load("//tcmalloc:copts.bzl", "TCMALLOC_DEFAULT_COPTS")
+load("//tcmalloc:variants.bzl", "create_tcmalloc_benchmark")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -113,6 +114,20 @@ cc_library(
     ],
 )
 
+create_tcmalloc_benchmark(
+    name = "linked_list_benchmark",
+    srcs = ["linked_list_benchmark.cc"],
+    copts = TCMALLOC_DEFAULT_COPTS,
+    malloc = "//tcmalloc",
+    deps = [
+        ":linked_list",
+        ":logging",
+        ":mock_span",
+        "@com_github_google_benchmark//:benchmark",
+        "@com_google_absl//absl/random",
+    ],
+)
+
 cc_test(
     name = "linked_list_test",
     size = "small",
@@ -121,6 +136,7 @@ cc_test(
     linkstatic = 1,
     deps = [
         ":linked_list",
+        ":mock_span",
         "@com_github_google_benchmark//:benchmark",
         "@com_google_absl//absl/container:node_hash_set",
         "@com_google_absl//absl/random",
@@ -208,6 +224,18 @@ cc_library(
     ],
 )
 
+create_tcmalloc_benchmark(
+    name = "mincore_benchmark",
+    srcs = ["mincore_benchmark.cc"],
+    copts = TCMALLOC_DEFAULT_COPTS,
+    deps = [
+        ":logging",
+        ":mincore",
+        "@com_github_google_benchmark//:benchmark",
+        "@com_google_absl//absl/memory",
+    ],
+)
+
 cc_test(
     name = "mincore_test",
     srcs = ["mincore_test.cc"],
@@ -218,6 +246,28 @@ cc_test(
         ":mincore",
         "@com_github_google_benchmark//:benchmark",
         "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "mock_span",
+    testonly = 1,
+    hdrs = ["mock_span.h"],
+    copts = TCMALLOC_DEFAULT_COPTS,
+    deps = [
+        ":linked_list",
+    ],
+)
+
+cc_library(
+    name = "optimization",
+    hdrs = ["optimization.h"],
+    copts = TCMALLOC_DEFAULT_COPTS,
+    visibility = [
+        "//tcmalloc:__subpackages__",
+    ],
+    deps = [
+        ":logging",
     ],
 )
 
@@ -244,6 +294,7 @@ cc_library(
     hdrs = ["percpu.h"],
     copts = TCMALLOC_DEFAULT_COPTS,
     textual_hdrs = [
+        "percpu_rseq_aarch64.S",
         "percpu_rseq_ppc.S",
         "percpu_rseq_x86_64.S",
     ],
@@ -331,18 +382,18 @@ cc_library(
     ],
     deps = [
         ":logging",
+        ":optimization",
     ],
 )
 
-cc_binary(
+create_tcmalloc_benchmark(
     name = "range_tracker_benchmark",
-    testonly = 1,
     srcs = ["range_tracker_benchmark.cc"],
     copts = TCMALLOC_DEFAULT_COPTS,
-    linkstatic = 1,
+    malloc = "//tcmalloc",
     deps = [
         ":range_tracker",
-        "@com_github_google_benchmark//:benchmark_main",
+        "@com_github_google_benchmark//:benchmark",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:fixed_array",
         "@com_google_absl//absl/random",

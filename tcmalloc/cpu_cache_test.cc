@@ -17,6 +17,7 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "tcmalloc/common.h"
+#include "tcmalloc/internal/optimization.h"
 #include "tcmalloc/internal/util.h"
 #include "tcmalloc/parameters.h"
 #include "tcmalloc/static_vars.h"
@@ -33,7 +34,7 @@ TEST(CpuCacheTest, Metadata) {
 
   const int num_cpus = absl::base_internal::NumCPUs();
 
-  CPUCache& cache = *Static::cpu_cache();
+  CPUCache& cache = Static::cpu_cache();
   // Since this test allocates memory, avoid activating the real fast path to
   // minimize allocations against the per-CPU cache.
   cache.Activate(CPUCache::ActivationMode::FastPathOffTestOnly);
@@ -60,7 +61,7 @@ TEST(CpuCacheTest, Metadata) {
 
   int allowed_cpu_id;
   const size_t kSizeClass = 3;
-  const size_t num_to_move = Static::sizemap()->num_objects_to_move(kSizeClass);
+  const size_t num_to_move = Static::sizemap().num_objects_to_move(kSizeClass);
   void* ptr;
   {
     // Restrict this thread to a single core while allocating and processing the
@@ -110,7 +111,7 @@ TEST(CpuCacheTest, Metadata) {
         EXPECT_GE(r.resident_size, 4096);
         break;
       case 18:
-        EXPECT_GE(r.resident_size, 135168);
+        EXPECT_GE(r.resident_size, 110592);
         break;
       default:
         ASSUME(false);

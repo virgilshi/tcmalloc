@@ -35,14 +35,10 @@ namespace tcmalloc {
 namespace {
 
 // Pick span pointer to use for page numbered i
-void* span(intptr_t i) {
-  return reinterpret_cast<void*>(i+1);
-}
+void* span(intptr_t i) { return reinterpret_cast<void*>(i + 1); }
 
 // Pick sizeclass to use for page numbered i
-uint8_t sc(intptr_t i) {
-  return i % 16;
-}
+uint8_t sc(intptr_t i) { return i % 16; }
 
 class PageMapTest : public ::testing::TestWithParam<int> {
  public:
@@ -52,7 +48,7 @@ class PageMapTest : public ::testing::TestWithParam<int> {
     map = new (storage) Map();
   }
 
-  ~PageMapTest() {
+  ~PageMapTest() override {
     for (void* ptr : *ptrs()) {
       ::operator delete(ptr);
     }

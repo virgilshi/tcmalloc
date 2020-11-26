@@ -41,7 +41,7 @@
  *     expected to be infrequent.
  * 2.  The upstream restartable sequence implementation expects the trailing 4
  *     bytes of the abort PC to be "signed" (to prevent manipulation of the PC
- *     to an arbitrary choice).  For us, this is PERCPU_RSEQ_SIGNATURE.  This
+ *     to an arbitrary choice).  For us, this is TCMALLOC_PERCPU_RSEQ_SIGNATURE.  This
  *     value is passed to the kernel during configuration of the rseq syscall.
  *     This would either need to be encoded as a nop (SIGN_ABORT) at the start
  *     of every restartable sequence, increasing instruction cache pressure, or
@@ -77,36 +77,36 @@
 //
 // TODO(b/141629158):  __rseq_cs only needs to be writeable to allow for
 // relocations, but could be read-only for non-PIE builds.
-#define DEFINE_UPSTREAM_CS(label)                   \
-  .pushsection __rseq_cs, "aw";                     \
-  .balign 32;                                       \
-  .protected __rseq_cs_##label;                     \
-  .type __rseq_cs_##label,@object;                  \
-  .size __rseq_cs_##label,32;                       \
-  __rseq_cs_##label:                                \
-  .long PERCPU_RSEQ_VERSION, PERCPU_RSEQ_FLAGS;     \
-  .quad .L##label##_start;                          \
-  .quad .L##label##_commit - .L##label##_start;     \
-  .quad label##_trampoline;                         \
-  PINSECTION(.L##label##array);                     \
-  .popsection;                                      \
-  .pushsection __rseq_cs_ptr_array, "aw";           \
-  .L##label##array:                                 \
-  .quad __rseq_cs_##label;                          \
-  .popsection;                                      \
-  SIGN_ABORT();                                     \
-  .globl label##_trampoline;                        \
-  .type  label##_trampoline, @function;             \
-label##_trampoline:                                 \
-  .cfi_startproc;                                   \
-  jmp .L##label##_abort;                            \
-  .cfi_endproc;                                     \
+#define DEFINE_UPSTREAM_CS(label)                                 \
+  .pushsection __rseq_cs, "aw";                                   \
+  .balign 32;                                                     \
+  .protected __rseq_cs_##label;                                   \
+  .type __rseq_cs_##label,@object;                                \
+  .size __rseq_cs_##label,32;                                     \
+  __rseq_cs_##label:                                              \
+  .long TCMALLOC_PERCPU_RSEQ_VERSION, TCMALLOC_PERCPU_RSEQ_FLAGS; \
+  .quad .L##label##_start;                                        \
+  .quad .L##label##_commit - .L##label##_start;                   \
+  .quad label##_trampoline;                                       \
+  PINSECTION(.L##label##array);                                   \
+  .popsection;                                                    \
+  .pushsection __rseq_cs_ptr_array, "aw";                         \
+  .L##label##array:                                               \
+  .quad __rseq_cs_##label;                                        \
+  .popsection;                                                    \
+  SIGN_ABORT();                                                   \
+  .globl label##_trampoline;                                      \
+  .type  label##_trampoline, @function;                           \
+label##_trampoline:                                               \
+  .cfi_startproc;                                                 \
+  jmp .L##label##_abort;                                          \
+  .cfi_endproc;                                                   \
   .size label##_trampoline, . - label##_trampoline;
 
 // This is part of the upstream rseq ABI.  The 4 bytes prior to the abort IP
-// must match PERCPU_RSEQ_SIGNATURE (as configured by our rseq syscall's
-// signature parameter).  This signature is used to annotate valid abort IPs
-// (since rseq_cs could live in a user-writable segment).
+// must match TCMALLOC_PERCPU_RSEQ_SIGNATURE (as configured by our rseq
+// syscall's signature parameter).  This signature is used to annotate valid
+// abort IPs (since rseq_cs could live in a user-writable segment).
 //
 // To allow this to be safely executed as a valid instruction, we encode the
 // value with a nop.  This is decoded as:
@@ -115,7 +115,7 @@ label##_trampoline:                                 \
 //
 #define SIGN_ABORT()           \
   .byte 0x0f, 0x1f, 0x05;      \
-  .long PERCPU_RSEQ_SIGNATURE;
+  .long TCMALLOC_PERCPU_RSEQ_SIGNATURE;
 
 /*
  * Provide a directive to specify the size of symbol "label", relative to the
@@ -228,21 +228,18 @@ tcmalloc_tls_fetch_pic:
   .type  TcmallocSlab_PerCpuCmpxchg64, @function
 TcmallocSlab_PerCpuCmpxchg64:
   .cfi_startproc
-.LTcmallocSlab_PerCpuCmpxchg64_region0:
   START_RSEQ(TcmallocSlab_PerCpuCmpxchg64);
   FETCH_CPU(%eax);
   cmp %eax, %edi; /* check cpu vs current_cpu */
-  jne .LTcmallocSlab_PerCpuCmpxchg64_region1;
+  jne .LTcmallocSlab_PerCpuCmpxchg64_commit;
   cmp %rdx, (%rsi); /* verify *p == old */
-  jne .LTcmallocSlab_PerCpuCmpxchg64_region2;
+  jne .LTcmallocSlab_PerCpuCmpxchg64_value_mismatch;
   mov %rcx, (%rsi);
-.LTcmallocSlab_PerCpuCmpxchg64_region1:
 .LTcmallocSlab_PerCpuCmpxchg64_commit:
   ret;  /* return current cpu, indicating mismatch OR success */
-.LTcmallocSlab_PerCpuCmpxchg64_region2:
+.LTcmallocSlab_PerCpuCmpxchg64_value_mismatch:
   mov $-1, %eax;  /* mismatch versus "old" or "check", return -1 */
   ret;
-.LTcmallocSlab_PerCpuCmpxchg64_region3:
   .cfi_endproc
 ENCODE_SIZE(TcmallocSlab_PerCpuCmpxchg64)
 DEFINE_UPSTREAM_CS(TcmallocSlab_PerCpuCmpxchg64)
@@ -252,21 +249,18 @@ DEFINE_UPSTREAM_CS(TcmallocSlab_PerCpuCmpxchg64)
   .type  TcmallocSlab_PerCpuCmpxchg64_VCPU, @function
 TcmallocSlab_PerCpuCmpxchg64_VCPU:
   .cfi_startproc
-.LTcmallocSlab_PerCpuCmpxchg64_VCPU_region0:
   START_RSEQ(TcmallocSlab_PerCpuCmpxchg64_VCPU);
   FETCH_VCPU(%eax);
   cmp %eax, %edi; /* check cpu vs current_cpu */
-  jne .LTcmallocSlab_PerCpuCmpxchg64_VCPU_region1;
+  jne .LTcmallocSlab_PerCpuCmpxchg64_VCPU_commit;
   cmp %rdx, (%rsi); /* verify *p == old */
-  jne .LTcmallocSlab_PerCpuCmpxchg64_VCPU_region2;
+  jne .LTcmallocSlab_PerCpuCmpxchg64_VCPU_value_mismatch;
   mov %rcx, (%rsi);
-.LTcmallocSlab_PerCpuCmpxchg64_VCPU_region1:
 .LTcmallocSlab_PerCpuCmpxchg64_VCPU_commit:
   ret;  /* return current cpu, indicating mismatch OR success */
-.LTcmallocSlab_PerCpuCmpxchg64_VCPU_region2:
+.LTcmallocSlab_PerCpuCmpxchg64_VCPU_value_mismatch:
   mov $-1, %eax;  /* mismatch versus "old" or "check", return -1 */
   ret;
-.LTcmallocSlab_PerCpuCmpxchg64_VCPU_region3:
   .cfi_endproc
 ENCODE_SIZE(TcmallocSlab_PerCpuCmpxchg64_VCPU)
 DEFINE_UPSTREAM_CS(TcmallocSlab_PerCpuCmpxchg64_VCPU)
@@ -299,15 +293,15 @@ DEFINE_UPSTREAM_CS(TcmallocSlab_PerCpuCmpxchg64_VCPU)
   .type  TcmallocSlab_PushBatch_FixedShift, @function
 TcmallocSlab_PushBatch_FixedShift:
   .cfi_startproc
-.LTcmallocSlab_PushBatch_FixedShift_region0:
   START_RSEQ(TcmallocSlab_PushBatch_FixedShift);
   FETCH_CPU(%r8d);
-  shl $PERCPU_TCMALLOC_FIXED_SLAB_SHIFT, %r8; /* multiply cpu by 256k */
+  shl $TCMALLOC_PERCPU_TCMALLOC_FIXED_SLAB_SHIFT, %r8;
+  	/* multiply cpu by 256k */
   lea (%rdi, %r8), %r8;
   movzwq (%r8, %rsi, 8), %r9; /* current */
   movzwq 6(%r8, %rsi, 8), %r10; /* end */
   cmpq %r10, %r9;
-  jae .LTcmallocSlab_PushBatch_FixedShift_region2;
+  jae .LTcmallocSlab_PushBatch_FixedShift_full;
   movq %rcx, %r11; /* r11 = copy of len */
   subq %r9, %r10; /* r10 = free capacity */
   cmpq %rcx, %r10;
@@ -321,15 +315,13 @@ TcmallocSlab_PushBatch_FixedShift:
   cmpq %r9, %r10;
   jne .LTcmallocSlab_PushBatch_FixedShift_loop
   movw %r9w, (%r8, %rsi, 8);
-.LTcmallocSlab_PushBatch_FixedShift_region1:
 .LTcmallocSlab_PushBatch_FixedShift_commit:
   movq %rcx, %rax;
   subq %r11, %rax;
   ret;
-.LTcmallocSlab_PushBatch_FixedShift_region2:
+.LTcmallocSlab_PushBatch_FixedShift_full:
   xor %rax, %rax;
   ret;
-.LTcmallocSlab_PushBatch_FixedShift_region3:
   .cfi_endproc
 ENCODE_SIZE(TcmallocSlab_PushBatch_FixedShift)
 DEFINE_UPSTREAM_CS(TcmallocSlab_PushBatch_FixedShift)
@@ -339,15 +331,15 @@ DEFINE_UPSTREAM_CS(TcmallocSlab_PushBatch_FixedShift)
   .type  TcmallocSlab_PushBatch_FixedShift_VCPU, @function
 TcmallocSlab_PushBatch_FixedShift_VCPU:
   .cfi_startproc
-.LTcmallocSlab_PushBatch_FixedShift_VCPU_region0:
   START_RSEQ(TcmallocSlab_PushBatch_FixedShift_VCPU);
   FETCH_VCPU(%r8d);
-  shl $PERCPU_TCMALLOC_FIXED_SLAB_SHIFT, %r8; /* multiply cpu by 256k */
+  shl $TCMALLOC_PERCPU_TCMALLOC_FIXED_SLAB_SHIFT, %r8;
+  	/* multiply cpu by 256k */
   lea (%rdi, %r8), %r8;
   movzwq (%r8, %rsi, 8), %r9; /* current */
   movzwq 6(%r8, %rsi, 8), %r10; /* end */
   cmpq %r10, %r9;
-  jae .LTcmallocSlab_PushBatch_FixedShift_VCPU_region2;
+  jae .LTcmallocSlab_PushBatch_FixedShift_VCPU_full;
   movq %rcx, %r11; /* r11 = copy of len */
   subq %r9, %r10; /* r10 = free capacity */
   cmpq %rcx, %r10;
@@ -361,15 +353,13 @@ TcmallocSlab_PushBatch_FixedShift_VCPU:
   cmpq %r9, %r10;
   jne .LTcmallocSlab_PushBatch_FixedShift_VCPU_loop
   movw %r9w, (%r8, %rsi, 8);
-.LTcmallocSlab_PushBatch_FixedShift_VCPU_region1:
 .LTcmallocSlab_PushBatch_FixedShift_VCPU_commit:
   movq %rcx, %rax;
   subq %r11, %rax;
   ret;
-.LTcmallocSlab_PushBatch_FixedShift_VCPU_region2:
+.LTcmallocSlab_PushBatch_FixedShift_VCPU_full:
   xor %rax, %rax;
   ret;
-.LTcmallocSlab_PushBatch_FixedShift_VCPU_region3:
   .cfi_endproc
 ENCODE_SIZE(TcmallocSlab_PushBatch_FixedShift_VCPU)
 DEFINE_UPSTREAM_CS(TcmallocSlab_PushBatch_FixedShift_VCPU)
@@ -402,15 +392,15 @@ DEFINE_UPSTREAM_CS(TcmallocSlab_PushBatch_FixedShift_VCPU)
   .type  TcmallocSlab_PopBatch_FixedShift, @function
 TcmallocSlab_PopBatch_FixedShift:
   .cfi_startproc
-.LTcmallocSlab_PopBatch_FixedShift_region0:
   START_RSEQ(TcmallocSlab_PopBatch_FixedShift);
   FETCH_CPU(%r8d);
-  shl $PERCPU_TCMALLOC_FIXED_SLAB_SHIFT, %r8; /* multiply cpu by 256k */
+  shl $TCMALLOC_PERCPU_TCMALLOC_FIXED_SLAB_SHIFT, %r8;
+  	/* multiply cpu by 256k */
   lea (%rdi, %r8), %r8;
   movzwq (%r8, %rsi, 8), %r9; /* current */
   movzwq 4(%r8, %rsi, 8), %r10; /* begin */
   cmp %r10, %r9;
-  jbe .LTcmallocSlab_PopBatch_FixedShift_region2;
+  jbe .LTcmallocSlab_PopBatch_FixedShift_empty;
   movq %r9, %r11;
   subq %r10, %r11; /* r11 = available items */
   cmpq %rcx, %r11;
@@ -424,13 +414,11 @@ TcmallocSlab_PopBatch_FixedShift:
   cmpq %rax, %r11;
   jne .LTcmallocSlab_PopBatch_FixedShift_loop
   movw %r9w, (%r8, %rsi, 8);
-.LTcmallocSlab_PopBatch_FixedShift_region1:
 .LTcmallocSlab_PopBatch_FixedShift_commit:
   ret;
-.LTcmallocSlab_PopBatch_FixedShift_region2:
+.LTcmallocSlab_PopBatch_FixedShift_empty:
   xor %rax, %rax;
   ret;
-.LTcmallocSlab_PopBatch_FixedShift_region3:
   .cfi_endproc
 ENCODE_SIZE(TcmallocSlab_PopBatch_FixedShift)
 DEFINE_UPSTREAM_CS(TcmallocSlab_PopBatch_FixedShift)
@@ -440,15 +428,15 @@ DEFINE_UPSTREAM_CS(TcmallocSlab_PopBatch_FixedShift)
   .type  TcmallocSlab_PopBatch_FixedShift_VCPU, @function
 TcmallocSlab_PopBatch_FixedShift_VCPU:
   .cfi_startproc
-.LTcmallocSlab_PopBatch_FixedShift_VCPU_region0:
   START_RSEQ(TcmallocSlab_PopBatch_FixedShift_VCPU);
   FETCH_VCPU(%r8d);
-  shl $PERCPU_TCMALLOC_FIXED_SLAB_SHIFT, %r8; /* multiply cpu by 256k */
+  shl $TCMALLOC_PERCPU_TCMALLOC_FIXED_SLAB_SHIFT, %r8;
+  	/* multiply cpu by 256k */
   lea (%rdi, %r8), %r8;
   movzwq (%r8, %rsi, 8), %r9; /* current */
   movzwq 4(%r8, %rsi, 8), %r10; /* begin */
   cmp %r10, %r9;
-  jbe .LTcmallocSlab_PopBatch_FixedShift_VCPU_region2;
+  jbe .LTcmallocSlab_PopBatch_FixedShift_VCPU_empty;
   movq %r9, %r11;
   subq %r10, %r11; /* r11 = available items */
   cmpq %rcx, %r11;
@@ -462,13 +450,11 @@ TcmallocSlab_PopBatch_FixedShift_VCPU:
   cmpq %rax, %r11;
   jne .LTcmallocSlab_PopBatch_FixedShift_VCPU_loop
   movw %r9w, (%r8, %rsi, 8);
-.LTcmallocSlab_PopBatch_FixedShift_VCPU_region1:
 .LTcmallocSlab_PopBatch_FixedShift_VCPU_commit:
   ret;
-.LTcmallocSlab_PopBatch_FixedShift_VCPU_region2:
+.LTcmallocSlab_PopBatch_FixedShift_VCPU_empty:
   xor %rax, %rax;
   ret;
-.LTcmallocSlab_PopBatch_FixedShift_VCPU_region3:
   .cfi_endproc
 ENCODE_SIZE(TcmallocSlab_PopBatch_FixedShift_VCPU)
 DEFINE_UPSTREAM_CS(TcmallocSlab_PopBatch_FixedShift_VCPU)
